@@ -73,6 +73,9 @@
     <div class="note" id="aiNote"></div>
 
     <h2>Монеты</h2>
+    <label class="mut" style="font-size:.85rem">Монеты вручную (через запятую, пусто = бот выбирает сам)</label>
+    <input type="text" id="coins" placeholder="например ENA, PEPE, SOL" style="width:100%;margin:4px 0 8px;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:7px 8px;font:inherit;text-transform:uppercase">
+    <div class="note" id="coinsNote" style="margin:-4px 0 8px"></div>
     <div class="row"><label>Монет одновременно</label><input type="number" id="maxCoins" min="1" max="30" step="1"></div>
     <div class="row"><label>Оборот 24ч от, млн USDT</label><input type="number" id="minTurn" min="0" step="1"></div>
     <div class="row"><label>Кандидатов в скане</label><input type="number" id="maxCand" min="5" step="5"></div>
@@ -166,6 +169,7 @@ function cfg() {
   const o = {};
   for (const k of NUMS) o[k] = +$(k).value;
   for (const k of BOOLS) o[k] = $(k).checked;
+  o.coins = $("coins").value;
   return o;
 }
 async function act(what) {
@@ -178,6 +182,7 @@ async function act(what) {
   } catch (e) { $("msg").textContent = e.message; $("msg").className = "dn"; }
   refresh();
 }
+$("coins").addEventListener("keydown", (e) => { if (e.key === "Enter") act("save"); });
 $("bStart").onclick = () => act("start"); $("bStop").onclick = () => act("stop"); $("bSave").onclick = () => act("save");
 $("bTest").onclick = () => act("test"); $("bClose").onclick = () => act("closeAll");
 $("bReset").onclick = () => { if (confirm("Очистить статистику сделок?")) act("reset"); };
@@ -195,7 +200,8 @@ function render(s) {
   $("aiNote").innerHTML = !ai.hasKey ? "<span class='dn'>Нет FAL_KEY — нейросеть выключена</span>"
     : (ai.err ? `<span class='dn'>ИИ: ${ai.err}</span>` : (ai.at ? `Решение ${tm(ai.at)}${ai.note ? " · " + ai.note : ""}` : "ждёт первого скана"))
       + (ai.tuneNote ? `<br>Последняя подстройка: ${ai.tuneNote}` : "");
-  if (!filled || !editing) { for (const k of NUMS) if (document.activeElement !== $(k)) $(k).value = b.cfg[k]; for (const k of BOOLS) $(k).checked = !!b.cfg[k]; filled = true; }
+  if (!filled || !editing) { for (const k of NUMS) if (document.activeElement !== $(k)) $(k).value = b.cfg[k]; for (const k of BOOLS) $(k).checked = !!b.cfg[k]; if (document.activeElement !== $("coins")) $("coins").value = b.cfg.coins || ""; filled = true; }
+  $("coinsNote").textContent = b.manual && b.manual.length ? "Торгую только: " + b.manual.map(x => x.replace("USDT", "")).join(", ") + " (без подбора и ИИ-фильтра)" : "Бот сам выбирает монеты";
   $("modeBadge").textContent = b.live ? "LIVE" : "СИМУЛЯЦИЯ"; $("modeBadge").className = "badge" + (b.live ? " live" : "");
   $("runBadge").textContent = b.running ? "РАБОТАЕТ" : "СТОП"; $("runBadge").className = "badge" + (b.running ? " on" : "");
   $("dayBadge").style.display = b.day && b.day.paused ? "" : "none";

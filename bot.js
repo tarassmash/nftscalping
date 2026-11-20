@@ -14,7 +14,7 @@ const PFX = "mb_";
 const MAKER = 0.0002, TAKER = 0.00055;
 const DEF = { live: false, simEq: 100, budgetPct: 80, maxCoins: 6, lev: 3, minTurn: 5, maxCand: 40, boxBars: 15, minBox: 0.4, maxBox: 4,
   buf: 0.1, pull: 0.1, chaseMax: 1, entryTimeout: 60, requote: 2, minProfit: 0.2, slRR: 1, hardSl: 0, tp: 0.6, act: 0.35, trail: 0.2, cooldown: 3, dayStop: 10,
-  imb: 0.35, flow: 0.3, depthPct: 0.3, flowSec: 10, confirm: 2, maxSpread: 0.08, flipExit: true,
+  coins: "", imb: 0.35, flow: 0.3, depthPct: 0.3, flowSec: 10, confirm: 2, maxSpread: 0.08, flipExit: true,
   aiOn: true, aiTune: true, aiEvery: 5, aiMinConf: 60, aiTuneHours: 6,
   longOn: true, shortOn: true, btcFilter: false };
 const NUMS = ["simEq", "budgetPct", "maxCoins", "lev", "minTurn", "maxCand", "boxBars", "minBox", "maxBox", "buf", "pull", "chaseMax", "entryTimeout", "requote",
@@ -52,6 +52,9 @@ function create(host) {
     host.log && host.log(msg);
   }
   const isLive = () => !!(CFG.live && keys());
+  // монеты, введённые вручную: "ena, pepe sol" → ["ENAUSDT", "PEPEUSDT", "SOLUSDT"]
+  const manualList = () => [...new Set(String(CFG.coins || "").toUpperCase().split(/[\s,;]+/).map(x => x.replace(/[^A-Z0-9]/g, "")).filter(Boolean).map(x => /USDT$/.test(x) ? x : x + "USDT"))];
+  const manual = () => manualList().length > 0;
   const AI = Object.assign({ at: 0, picks: {}, note: "", err: "", tuneAt: now(), tuneNote: "", tuneN: 0, calls: 0 }, lsGet("mb.ai", {}));
   const saveAi = () => lsSet("mb.ai", AI);
   const aiReady = () => !!(CFG.aiOn && host.fal);
@@ -87,7 +90,7 @@ function create(host) {
   // ---------------- state ----------------
   const C = {};   // sym -> { sym, last, bid, ask, hi, lo, box, atr, pos, work, lev, hedge }
   const coin = (sym) => C[sym] || (C[sym] = { sym, last: 0, bid: 0, ask: 0, hi: 0, lo: 0, box: 0, atr: 0, pos: null, work: null, lev: false, hedge: null });
-  let ACTIVE = [], EQ = 0, AVAIL = 0, FOREIGN = new Set(), lastScanAt = 0, scanBusy = false, fastBusy = false, scanTimer = null, fastTimer = null, eqAt = 0;
+  let lastBad = "", ACTIVE = [], EQ = 0, AVAIL = 0, FOREIGN = new Set(), lastScanAt = 0, scanBusy = false, fastBusy = false, scanTimer = null, fastTimer = null, eqAt = 0;
   let BTC = { up: null, down: null, why: "—", at: 0 };
 
   async function btcTrend() {
@@ -159,7 +162,21 @@ function create(host) {
     try {
       await equity();
       const t = await pub("/v5/market/tickers", { category: "linear" });
-      const rows = (t.list || []).filter(x => /USDT$/.test(x.symbol) && !blocked(x.symbol) && +x.turnover24h >= CFG.minTurn * 1e6 && +x.lastPrice > 0 && +x.bid1Price > 0)
+      const all = t.list || [];
+      if (manual()) {   // ручной список: торгую только эти монеты, без подбора и ИИ
+        const exist = new Set(all.map(x => x.symbol)), want = manualList();
+        const bad = want.filter(s => !exist.has(s));
+        const next = want.filter(s => exist.has(s));
+        for (const s of [...Object.keys(OPEN), ...Object.keys(C).filter(s => C[s].work)]) if (!next.includes(s)) next.push(s);
+        const key = bad.join(",");
+        if (bad.length && key !== lastBad) log(`Нет на Bybit (USDT-перп): ${bad.join(", ")}`, "err");
+        lastBad = key;
+        const gone = ACTIVE.filter(s => !next.includes(s)), added = next.filter(s => !ACTIVE.includes(s));
+        ACTIVE = next; lastScanAt = now();
+        if (added.length || gone.length) log(`Монеты вручную: ${ACTIVE.map(s => s.replace("USDT", "")).join(", ") || "—"}`);
+        return;
+      }
+      const rows = all.filter(x => /USDT$/.test(x.symbol) && !blocked(x.symbol) && +x.turnover24h >= CFG.minTurn * 1e6 && +x.lastPrice > 0 && +x.bid1Price > 0)
         .map(x => { const mid = (+x.bid1Price + +x.ask1Price) / 2; return { sym: x.symbol, ch24: +(+x.price24hPcnt * 100).toFixed(2), range24: (+x.highPrice24h - +x.lowPrice24h) / +x.lastPrice * 100,
           spread: (+x.ask1Price - +x.bid1Price) / mid * 100, turn: +x.turnover24h }; })
         .filter(x => x.spread <= CFG.maxSpread && !FOREIGN.has(x.sym))
@@ -330,9 +347,9 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (!running || DAY.paused || OPEN[c.sym] || (c.pos && c.pos.size > 0) || c.work) return null;
     if ((COOL[c.sym] || 0) > now() || !ACTIVE.includes(c.sym) || FOREIGN.has(c.sym) || !c.bookAt || now() - c.bookAt > 5000) return null;
     if (Object.keys(OPEN).length + Object.values(C).filter(x => x.work && x.work.kind === "entry").length >= CFG.maxCoins) return null;
-    if (!(c.spread <= CFG.maxSpread)) return null;
+    if (!manual() && !(c.spread <= CFG.maxSpread)) return null;
     let okL = CFG.longOn && (!CFG.btcFilter || !BTC.down), okS = CFG.shortOn && (!CFG.btcFilter || !BTC.up);
-    if (aiFresh()) {
+    if (aiFresh() && !manual()) {
       const a = AI.picks[c.sym];
       if (!a || a.conf < CFG.aiMinConf) return null;
       okL = okL && (a.side === "long" || a.side === "both"); okS = okS && (a.side === "short" || a.side === "both");
@@ -597,6 +614,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     const wasLive = isLive();
     for (const k of NUMS) if (x[k] != null && x[k] !== "" && Number.isFinite(+x[k])) CFG[k] = +x[k];
     for (const k of BOOLS) if (x[k] != null) CFG[k] = !!x[k];
+    if (x.coins != null) { const before = CFG.coins; CFG.coins = String(x.coins).slice(0, 500); if (before !== CFG.coins && running) setTimeout(scan, 100); }
     CFG.lev = Math.min(Math.max(1, CFG.lev), 10); CFG.maxCoins = Math.min(Math.max(1, Math.round(CFG.maxCoins)), 30);
     CFG.boxBars = Math.min(Math.max(3, Math.round(CFG.boxBars)), 200); CFG.budgetPct = Math.min(Math.max(5, CFG.budgetPct), 95);
     CFG.requote = Math.max(1, CFG.requote); CFG.entryTimeout = Math.max(3, CFG.entryTimeout);
@@ -622,7 +640,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
         trailOn: OPEN[s] ? !!OPEN[s].trailOn : false, cool: Math.max(0, (COOL[s] || 0) - now()) };
     });
     const ai = { ready: aiReady(), hasKey: !!host.fal, fresh: aiFresh(), at: AI.at, note: AI.note, err: AI.err, tuneAt: AI.tuneAt, tuneNote: AI.tuneNote, picks: AI.picks };
-    return { ai, running, live: isLive(), cfg: CFG, eq: EQ, avail: AVAIL, day: DAY, stats: stats(), coins, trades: TRADES.filter(t => t.live === isLive()).slice(0, 100),
+    return { manual: manualList(), ai, running, live: isLive(), cfg: CFG, eq: EQ, avail: AVAIL, day: DAY, stats: stats(), coins, trades: TRADES.filter(t => t.live === isLive()).slice(0, 100),
       log: LOG.slice(0, 200), lastScanAt, notional: notional(), btc: CFG.btcFilter ? BTC.why : null };
   }
 
