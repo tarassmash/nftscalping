@@ -201,7 +201,7 @@ function render(s) {
     : (ai.err ? `<span class='dn'>ИИ: ${ai.err}</span>` : (ai.at ? `Решение ${tm(ai.at)}${ai.note ? " · " + ai.note : ""}` : "ждёт первого скана"))
       + (ai.tuneNote ? `<br>Последняя подстройка: ${ai.tuneNote}` : "");
   if (!filled || !editing) { for (const k of NUMS) if (document.activeElement !== $(k)) $(k).value = b.cfg[k]; for (const k of BOOLS) $(k).checked = !!b.cfg[k]; if (document.activeElement !== $("coins")) $("coins").value = b.cfg.coins || ""; filled = true; }
-  $("coinsNote").textContent = b.manual && b.manual.length ? "Торгую только: " + b.manual.map(x => x.replace("USDT", "")).join(", ") + " (без подбора и ИИ-фильтра)" : "Бот сам выбирает монеты";
+  $("coinsNote").textContent = b.manual && b.manual.length ? "Торгую только: " + b.manual.map(x => x.replace("USDT", "")).join(", ") + " — вход сразу, сторона по стакану, после выхода перезаход через 10 с" : "Бот сам выбирает монеты";
   $("modeBadge").textContent = b.live ? "LIVE" : "СИМУЛЯЦИЯ"; $("modeBadge").className = "badge" + (b.live ? " live" : "");
   $("runBadge").textContent = b.running ? "РАБОТАЕТ" : "СТОП"; $("runBadge").className = "badge" + (b.running ? " on" : "");
   $("dayBadge").style.display = b.day && b.day.paused ? "" : "none";

@@ -354,6 +354,11 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       if (!a || a.conf < CFG.aiMinConf) return null;
       okL = okL && (a.side === "long" || a.side === "both"); okS = okS && (a.side === "short" || a.side === "both");
     }
+    if (manual()) {   // монета выбрана вручную — вхожу сразу, сторона по стакану и потоку прямо сейчас
+      const bias = (c.I || 0) + (c.F || 0);
+      const side = okL && (bias >= 0 || !okS) ? "Buy" : okS ? "Sell" : null;
+      return side ? { side, level: side === "Buy" ? c.ask : c.bid } : null;
+    }
     if (okL && c.sigL >= CFG.confirm) return { side: "Buy", level: c.ask };
     if (okS && c.sigS >= CFG.confirm) return { side: "Sell", level: c.bid };
     return null;
@@ -415,7 +420,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
           } else {
             const bad = w.full ? null : entryValid(c, w);
             if (w.full) { if (now() - w.start > CFG.entryTimeout * 1000 + 15000) c.work = null; }   // жду, пока позиция появится
-            else if (bad) { await liveCancel(c, w); c.work = null; COOL[sym] = now() + 30000; log(`${sym}: вход ${word(w.side)} отменён — ${bad}`); }
+            else if (bad) { await liveCancel(c, w); c.work = null; COOL[sym] = now() + (manual() ? 5000 : 30000); log(`${sym}: вход ${word(w.side)} отменён — ${bad}`); }
             else await liveQuote(c, w);
           }
           continue;
@@ -437,7 +442,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
         if (e) {
           await prep(sym);
           c.work = { kind: "entry", side: e.side, level: e.level, start: now() };
-          log(`${sym}: ${e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой у ${fmt(e.level)}`);
+          log(`${sym}: ${manual() ? (e.side === "Buy" ? "▶ вручную, лонг" : "▶ вручную, шорт") : e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой у ${fmt(e.level)}`);
           await liveQuote(c, c.work);
         }
       } catch (err) { log(`${sym}: ${err.message}`, "err"); }
@@ -505,7 +510,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     TRADES.unshift(tr); saveTrades();
     delete OPEN[sym]; saveOpen();
     const c = coin(sym); c.pos = null; c.work = null;
-    COOL[sym] = now() + CFG.cooldown * 60000; lsSet("mb.cool", COOL);
+    COOL[sym] = now() + (manual() ? 10000 : CFG.cooldown * 60000); lsSet("mb.cool", COOL);
     const p = tr.pnl;
     log(`${sym}: ${word(o.side)} закрыт${exit ? " @ " + fmt(exit) : ""} · ${why} · ${p == null ? "PnL —" : (p >= 0 ? "+" : "") + p.toFixed(3) + " USDT"}`, p != null && p < 0 ? "err" : "ok");
   }
@@ -530,7 +535,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
           log(`${sym}: ✅ ${word(w.side)} @ ${fmt(entry)} (сим, мейкер) · тейк @ ${fmt(OPEN[sym].take)}`, "ok");
         } else {
           const bad = entryValid(c, w);
-          if (bad) { c.work = null; COOL[sym] = now() + 30000; log(`${sym}: вход ${word(w.side)} отменён — ${bad}`); }
+          if (bad) { c.work = null; COOL[sym] = now() + (manual() ? 5000 : 30000); log(`${sym}: вход ${word(w.side)} отменён — ${bad}`); }
           else requote(w);
         }
       } else if (w && w.kind === "exit") {
@@ -560,7 +565,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       if (e) {
         c.work = { kind: "entry", side: e.side, level: e.level, start: now() }; requote(c.work);
         if (!INST[sym]) inst(sym).catch(() => {});
-        log(`${sym}: ${e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой @ ${fmt(c.work.px)} (сим)`);
+        log(`${sym}: ${manual() ? (e.side === "Buy" ? "▶ вручную, лонг" : "▶ вручную, шорт") : e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой @ ${fmt(c.work.px)} (сим)`);
       }
     }
   }
