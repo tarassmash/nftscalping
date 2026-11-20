@@ -6,6 +6,7 @@
 //  • после входа сразу стоит лимитка тейка +tp % (мейкер, исполняется, когда цена идёт в нашу сторону);
 //  • ВЫХОД ТОЛЬКО В ПЛЮС: стопа нет; трейлинг (с +act %, откат trail %) — выход PostOnly-лимиткой, догоняющей цену,
 //    но никогда ниже входа + minProfit % (лимитка ждёт на этом уровне, пока цена вернётся);
+//  • риск 1:1 — минус по позиции не больше тейка: при −tp×slRR % выход лимиткой с догоном (slRR 0 = без стопа);
 //  • 🧠 нейросеть (fal.ai) каждые aiEvery мин выбирает монеты и сторону, раз в aiTuneHours ч подстраивает параметры;
 //  • страховка на случай падения сервера: аварийный стоп hardSl % на бирже (0 = выкл) — далеко, в обычной работе не срабатывает;
 //  • одна позиция на монету, пауза после выхода, защита дня: при −dayStop % от депозита на начало дня новые входы не ставятся;
@@ -15,11 +16,11 @@
 const PFX = "mb_";
 const MAKER = 0.0002, TAKER = 0.00055;
 const DEF = { live: false, simEq: 100, budgetPct: 80, maxCoins: 6, lev: 3, minTurn: 5, maxCand: 40, boxBars: 15, minBox: 0.4, maxBox: 4,
-  buf: 0.1, pull: 0.1, chaseMax: 1, entryTimeout: 60, requote: 2, minProfit: 0.2, hardSl: 0, tp: 0.6, act: 0.35, trail: 0.2, cooldown: 3, dayStop: 10,
+  buf: 0.1, pull: 0.1, chaseMax: 1, entryTimeout: 60, requote: 2, minProfit: 0.2, slRR: 1, hardSl: 0, tp: 0.6, act: 0.35, trail: 0.2, cooldown: 3, dayStop: 10,
   aiOn: true, aiTune: true, aiEvery: 5, aiMinConf: 60, aiTuneHours: 6,
   longOn: true, shortOn: true, btcFilter: false };
 const NUMS = ["simEq", "budgetPct", "maxCoins", "lev", "minTurn", "maxCand", "boxBars", "minBox", "maxBox", "buf", "pull", "chaseMax", "entryTimeout", "requote",
-  "minProfit", "hardSl", "tp", "act", "trail", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours"];
+  "minProfit", "slRR", "hardSl", "tp", "act", "trail", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours"];
 const BOOLS = ["live", "longOn", "shortOn", "btcFilter", "aiOn", "aiTune"];
 // в каких рамках ИИ может менять параметры
 const AI_BOUNDS = { tp: [0.3, 3], act: [0.2, 2], trail: [0.1, 1], minProfit: [0.1, 1], pull: [0, 0.5], minBox: [0.2, 2], maxBox: [1, 8], buf: [0, 0.5], boxBars: [5, 60], cooldown: [0, 30] };
@@ -264,8 +265,7 @@ function create(host) {
     });
     const prompt = `You pick trades for a Bybit USDT-perpetual BREAKOUT scalper. For each coin the bot keeps a range = high/low of the last ${CFG.boxBars} one-minute candles.
 When price breaks ${CFG.buf}% beyond the range it enters with a maker limit order on the retest (${CFG.pull}% behind price), LONG above the high, SHORT below the low.
-Exit ONLY IN PROFIT, there is NO stop loss: a maker take +${CFG.tp}%, or trailing from +${CFG.act}% with ${CFG.trail}% callback, never below entry +${CFG.minProfit}%.
-A position that goes against us is held until price returns, which blocks margin. Leverage ${CFG.lev}x. Maker fees ~0.04% round trip.
+Exit: a maker take +${CFG.tp}%, or trailing from +${CFG.act}% with ${CFG.trail}% callback (never below entry +${CFG.minProfit}%); risk 1:${CFG.slRR}: at −${(CFG.tp * CFG.slRR).toFixed(2)}% the position is closed by a chasing maker limit. Leverage ${CFG.lev}x. Maker fees ~0.04% round trip.
 Goal: maximise trades that reach profit quickly. Prefer coins whose breakouts follow through (trend, momentum, compression before breakout) and that mean-revert rather than collapse; avoid coins in a one-way dump/pump against the side, choppy fake-outs, or coins where the bot is already stuck.
 BTC 5m trend: ${BTC.why}.
 Coins (closes1m = % change of each 1m close vs the first, oldest first; posInBox 0 = at low, 1 = at high; recent = this bot's last trades on the coin):
@@ -299,7 +299,7 @@ Answer ONLY one JSON object: {"picks":[{"sym":"ABC","side":"long|short|both|none
       const sum = since.reduce((a, t) => a + t.pnl, 0), byWhy = {};
       for (const t of since) { const w = byWhy[t.why] || (byWhy[t.why] = { n: 0, pnl: 0 }); w.n++; w.pnl = +(w.pnl + t.pnl).toFixed(3); }
       const prompt = `Tune a Bybit breakout scalper. Current params: ${JSON.stringify(cur)}. Allowed ranges: ${JSON.stringify(AI_BOUNDS)}.
-Meaning: tp = maker take %, act = trailing activation %, trail = trailing callback %, minProfit = minimum exit profit % (no stop loss: exits only in profit), pull = entry limit offset behind price %, minBox/maxBox = allowed range width %, buf = entry offset beyond range %, boxBars = range length in 1m candles, cooldown = minutes before re-entering a coin.
+Meaning: tp = maker take %, act = trailing activation %, trail = trailing callback %, minProfit = minimum trailing exit profit %, the stop is −tp × ${CFG.slRR} (risk 1:${CFG.slRR}), pull = entry limit offset behind price %, minBox/maxBox = allowed range width %, buf = entry offset beyond range %, boxBars = range length in 1m candles, cooldown = minutes before re-entering a coin.
 Since the last tuning: ${since.length} trades, total PnL ${sum.toFixed(3)} USDT, by exit reason ${JSON.stringify(byWhy)}. Trades: ${JSON.stringify(tradeStats().slice(0, 40))}.
 Change at most 3 params, small steps, only if the data supports it. Answer ONLY JSON: {"set":{"param":value},"why":"коротко по-русски"}.`;
       const j = await host.fal(prompt, "You are a careful quant tuning a trading bot. Answer only with one JSON object.");
@@ -346,6 +346,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (L ? p > o.best : p < o.best) o.best = p;
     const gain = (p / o.entry - 1) * 100 * dir;
     if (!o.trailOn && gain >= CFG.act) { o.trailOn = true; log(`${c.sym}: 🎯 трейлинг включён (+${gain.toFixed(2)}%)`); }
+    if (CFG.slRR > 0 && CFG.tp > 0 && gain <= -CFG.tp * CFG.slRR) return "стоп 1:" + CFG.slRR;
     if (o.trailOn && (o.best / p - 1) * 100 * dir >= CFG.trail && gain >= CFG.minProfit) return "трейлинг";
     return null;
   }
@@ -399,7 +400,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
           if (!c.pos) { await closedLive(sym, OPEN[sym].takeId ? "тейк" : "биржа"); continue; }   // тейк исполнился / аварийный стоп / вручную
           OPEN[sym].qty = c.pos.size;
           const why = exitWhy(c, OPEN[sym]); saveOpen();
-          if (why) { await cancelTake(c); c.work = { kind: "exit", side: opp(OPEN[sym].side), why, start: now() }; log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.last)}`); await liveQuote(c, c.work); }
+          if (why) { await cancelTake(c); c.work = { kind: "exit", side: opp(OPEN[sym].side), why, start: now(), noFloor: /^стоп/.test(why) }; log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.last)}`); await liveQuote(c, c.work); }
           else await ensureTake(c);
           continue;
         }
@@ -521,7 +522,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
         }
         if (!c.work) {
           const why = exitWhy(c, o); saveOpen();
-          if (why) { c.work = { kind: "exit", side: opp(o.side), why, start: now() }; requote(c.work); log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.work.px)}`); }
+          if (why) { c.work = { kind: "exit", side: opp(o.side), why, start: now(), noFloor: /^стоп/.test(why) }; requote(c.work); log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.work.px)}`); }
         }
         continue;
       }
@@ -558,7 +559,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (CFG.live && !keys()) throw new Error("Нет BYBIT_API_KEY / BYBIT_API_SECRET — Live недоступен");
     running = true; lsSet("mb.running", true);
     await cleanStale();
-    log(`СТАРТ ${isLive() ? "LIVE" : "симуляция"} · только лимитки-мейкеры: до ${CFG.maxCoins} монет · коридор ${CFG.boxBars} мин (${CFG.minBox}–${CFG.maxBox}%) · пробой +${CFG.buf}% · догоняю до ${CFG.chaseMax}% / ${CFG.entryTimeout} с · вход на ${CFG.pull}% за ценой · тейк +${CFG.tp}% · трейлинг с +${CFG.act}% откат ${CFG.trail}% · выход только в плюс (≥ +${CFG.minProfit}%) · ИИ ${aiReady() ? "вкл" : "выкл"} · аварийный стоп ${CFG.hardSl || "выкл"}${CFG.hardSl ? "%" : ""} · плечо x${CFG.lev} · ${CFG.budgetPct}% депозита`, "ok");
+    log(`СТАРТ ${isLive() ? "LIVE" : "симуляция"} · только лимитки-мейкеры: до ${CFG.maxCoins} монет · коридор ${CFG.boxBars} мин (${CFG.minBox}–${CFG.maxBox}%) · пробой +${CFG.buf}% · догоняю до ${CFG.chaseMax}% / ${CFG.entryTimeout} с · вход на ${CFG.pull}% за ценой · тейк +${CFG.tp}% · трейлинг с +${CFG.act}% откат ${CFG.trail}% · трейлинг не хуже +${CFG.minProfit}% · стоп 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%) лимиткой · ИИ ${aiReady() ? "вкл" : "выкл"} · аварийный стоп ${CFG.hardSl || "выкл"}${CFG.hardSl ? "%" : ""} · плечо x${CFG.lev} · ${CFG.budgetPct}% депозита`, "ok");
     loops(); scan();
     return isLive() ? "Запущено — LIVE" : "Запущено — симуляция";
   }

@@ -93,7 +93,8 @@
     <h2>Выход</h2>
     <div class="row"><label>Выход не хуже, чем +%</label><input type="number" id="minProfit" min="0.05" step="0.05"></div>
     <div class="row"><label>Аварийный стоп биржи, % (0 = выкл)</label><input type="number" id="hardSl" min="0" step="1"></div>
-    <div class="note">Стопа нет: позиция закрывается только в плюс. Аварийный стоп — маркет, по умолчанию выключен.</div>
+    <div class="row"><label>Риск 1 : N (стоп = тейк × N, 0 = нет)</label><input type="number" id="slRR" min="0" step="0.25"></div>
+    <div class="note">Стоп = тейк × N: при 1 минус по позиции не больше тейка. Выход лимиткой с догоном. Аварийный стоп — маркет, по умолчанию выключен.</div>
     <div class="row"><label>Тейк лимиткой, % (0 = нет)</label><input type="number" id="tp" min="0" step="0.05"></div>
     <div class="row"><label>Трейлинг включается с, %</label><input type="number" id="act" min="0.05" step="0.05"></div>
     <div class="row"><label>Откат трейлинга, %</label><input type="number" id="trail" min="0.05" step="0.05"></div>
@@ -147,7 +148,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const NUMS = ["maxCoins","minTurn","maxCand","boxBars","minBox","maxBox","buf","pull","chaseMax","entryTimeout","requote","minProfit","hardSl","tp","act","trail","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
+const NUMS = ["maxCoins","minTurn","maxCand","boxBars","minBox","maxBox","buf","pull","chaseMax","entryTimeout","requote","minProfit","slRR","hardSl","tp","act","trail","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
 const BOOLS = ["live","longOn","shortOn","btcFilter","aiOn","aiTune"];
 let filled = false, editing = false;
 const f = (v, d) => v == null || !isFinite(v) ? "—" : (+v).toFixed(d == null ? 2 : d);
