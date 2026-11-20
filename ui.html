@@ -51,7 +51,7 @@
 </head>
 <body>
 <header>
-  <h1><span>Пробои</span> · маркет-мейкер за ценой <small style="font-size:.7rem;color:var(--muted);font-weight:400">· сервер 24/7</small></h1>
+  <h1><span>Пробои</span> · мейкер-лимитки за ценой <small style="font-size:.7rem;color:var(--muted);font-weight:400">· сервер 24/7</small></h1>
   <div style="display:flex;gap:8px"><span class="badge" id="modeBadge">СИМУЛЯЦИЯ</span><span class="badge" id="runBadge">СТОП</span><span class="badge warn" id="dayBadge" style="display:none">🛡 ЗАЩИТА ДНЯ</span></div>
 </header>
 
@@ -82,16 +82,21 @@
     <div class="row"><label>Ширина коридора от, %</label><input type="number" id="minBox" min="0" step="0.1"></div>
     <div class="row"><label>Ширина коридора до, %</label><input type="number" id="maxBox" min="0.1" step="0.1"></div>
     <div class="row"><label>Вход за границей, %</label><input type="number" id="buf" min="0" step="0.05"></div>
-    <div class="row"><label>Допуск исполнения, %</label><input type="number" id="slip" min="0.01" step="0.05"></div>
+    <div class="row"><label>Лимитка входа за ценой, %</label><input type="number" id="pull" min="0" step="0.05"></div>
+    <div class="row"><label>Догонять вход до, % от уровня</label><input type="number" id="chaseMax" min="0.05" step="0.05"></div>
+    <div class="row"><label>Ждать вход до, сек</label><input type="number" id="entryTimeout" min="3" step="5"></div>
+    <div class="row"><label>Переставлять лимитку каждые, сек</label><input type="number" id="requote" min="1" step="1"></div>
     <div class="row"><label>Лонги (пробой вверх)</label><input type="checkbox" id="longOn"></div>
     <div class="row"><label>Шорты (пробой вниз)</label><input type="checkbox" id="shortOn"></div>
     <div class="row"><label>Фильтр BTC (по тренду)</label><input type="checkbox" id="btcFilter"></div>
 
     <h2>Выход</h2>
-    <div class="row"><label>Стоп, %</label><input type="number" id="sl" min="0.1" step="0.1"></div>
+    <div class="row"><label>Выход не хуже, чем +%</label><input type="number" id="minProfit" min="0.05" step="0.05"></div>
+    <div class="row"><label>Аварийный стоп биржи, % (0 = выкл)</label><input type="number" id="hardSl" min="0" step="1"></div>
+    <div class="note">Стопа нет: позиция закрывается только в плюс. Аварийный стоп — маркет, по умолчанию выключен.</div>
+    <div class="row"><label>Тейк лимиткой, % (0 = нет)</label><input type="number" id="tp" min="0" step="0.05"></div>
     <div class="row"><label>Трейлинг включается с, %</label><input type="number" id="act" min="0.05" step="0.05"></div>
     <div class="row"><label>Откат трейлинга, %</label><input type="number" id="trail" min="0.05" step="0.05"></div>
-    <div class="row"><label>Тейк максимум, % (0 = нет)</label><input type="number" id="tpMax" min="0" step="0.5"></div>
     <div class="row"><label>Пауза после выхода, мин</label><input type="number" id="cooldown" min="0" step="1"></div>
 
     <h2>Риск</h2>
@@ -104,10 +109,10 @@
     <button class="btn stop" id="bStop">■ Стоп (снять входы)</button>
     <button class="btn sec" id="bSave">Сохранить настройки</button>
     <button class="btn sec" id="bTest">Проверить связь с Bybit</button>
-    <button class="btn danger" id="bClose">Закрыть все позиции бота по рынку</button>
+    <button class="btn danger" id="bClose">Закрыть все позиции бота сейчас (лимиткой, даже в минус)</button>
     <button class="btn sec" id="bReset">Очистить статистику</button>
     <div id="msg"></div>
-    <div class="note">Стоп и трейлинг стоят на бирже: если сервер упадёт, позиции всё равно защищены. Бот трогает только свои ордера (mb_) и свои монеты.</div>
+    <div class="note">Вход и выход — только лимитки-мейкеры с догоном (PostOnly, комиссия ~0.02%), маркета нет. Выход только в плюс. Бот трогает только свои ордера (mb_) и свои монеты.</div>
   </aside>
 
   <section class="main">
@@ -120,8 +125,8 @@
     <div class="panel">
       <h2>Монеты <span class="mut" id="scanAt" style="text-transform:none;letter-spacing:0"></span></h2>
       <div class="tbl"><table>
-        <thead><tr><th>Монета</th><th>Цена</th><th>Коридор</th><th>Ширина</th><th>Волат. 1м</th><th>BUY выше</th><th>SELL ниже</th><th>ИИ</th><th>Позиция</th><th>PnL</th></tr></thead>
-        <tbody id="coins"><tr><td colspan="10" class="mut">—</td></tr></tbody>
+        <thead><tr><th>Монета</th><th>Цена</th><th>Коридор</th><th>Ширина</th><th>Волат. 1м</th><th>Пробой ↑</th><th>Пробой ↓</th><th>Лимитка</th><th>ИИ</th><th>Позиция</th><th>PnL</th></tr></thead>
+        <tbody id="coins"><tr><td colspan="11" class="mut">—</td></tr></tbody>
       </table></div>
     </div>
 
@@ -142,7 +147,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const NUMS = ["maxCoins","minTurn","maxCand","boxBars","minBox","maxBox","buf","slip","sl","act","trail","tpMax","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
+const NUMS = ["maxCoins","minTurn","maxCand","boxBars","minBox","maxBox","buf","pull","chaseMax","entryTimeout","requote","minProfit","hardSl","tp","act","trail","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
 const BOOLS = ["live","longOn","shortOn","btcFilter","aiOn","aiTune"];
 let filled = false, editing = false;
 const f = (v, d) => v == null || !isFinite(v) ? "—" : (+v).toFixed(d == null ? 2 : d);
@@ -205,9 +210,10 @@ function render(s) {
   $("coins").innerHTML = b.coins.length ? b.coins.map(c => {
     const pos = c.pos ? `<span class="${c.pos.side === "Buy" ? "up" : "dn"}">${c.pos.side === "Buy" ? "лонг" : "шорт"} ${p(c.pos.size)} @ ${p(c.pos.avg)}</span>${c.trailOn ? " 🎯" : ""}` : (c.cool ? `<span class="mut">пауза ${Math.ceil(c.cool / 60000)} мин</span>` : "<span class='mut'>—</span>");
     return `<tr><td><b>${c.sym.replace("USDT", "")}</b></td><td>${p(c.last)}</td><td>${p(c.lo)} – ${p(c.hi)}</td><td>${f(c.box)}%</td><td>${f(c.atr, 2)}%</td>
-      <td class="up">${c.buy ? p(c.buy) : "<span class='mut'>—</span>"}</td><td class="dn">${c.sell ? p(c.sell) : "<span class='mut'>—</span>"}</td>
+      <td class="up">${c.up ? p(c.up) : "—"}</td><td class="dn">${c.dn ? p(c.dn) : "—"}</td>
+      <td>${c.work ? `<span class="${c.work.side === "Buy" ? "up" : "dn"}">${c.work.kind === "entry" ? "вход" : "выход" + (c.work.why ? " (" + c.work.why + ")" : "")} ${c.work.side} @ ${p(c.work.px)}</span>` : "<span class='mut'>—</span>"}</td>
       <td>${aiCell(b.ai, c.sym)}</td><td>${pos}</td><td class="${c.pos ? cls(c.pos.upnl) : "mut"}">${c.pos ? sgn(c.pos.upnl, 3) : "—"}</td></tr>`;
-  }).join("") : `<tr><td colspan="10" class="mut">${b.running ? "жду скан…" : "бот остановлен"}</td></tr>`;
+  }).join("") : `<tr><td colspan="11" class="mut">${b.running ? "жду скан…" : "бот остановлен"}</td></tr>`;
   $("trades").innerHTML = b.trades.length ? b.trades.map(t => `<tr><td><b>${t.sym.replace("USDT", "")}</b></td>
     <td class="${t.side === "Buy" ? "up" : "dn"}">${t.side === "Buy" ? "лонг" : "шорт"}</td><td>${p(t.entry)}</td><td>${p(t.exit)}</td><td>${t.why}</td>
     <td>${dur(t.close - t.open)}</td><td class="${cls(t.pnl)}">${t.pnl == null ? "—" : sgn(t.pnl, 3)}</td><td class="mut">${tm(t.close)}</td></tr>`).join("")
