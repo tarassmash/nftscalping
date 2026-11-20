@@ -7,6 +7,8 @@
 //    стакан развернулся, цена ушла дальше chaseMax % или прошло entryTimeout сек — вход отменён;
 //  • выход: лимитка тейка +tp %; трейлинг (с +act %, откат trail %, не хуже +minProfit %); стакан развернулся против — выход лимиткой;
 //    риск 1:slRR — при −tp×slRR % выход лимиткой с догоном; аварийный стоп hardSl % на бирже (0 = выкл);
+//  • 📈 фильтр 5-мин прогноза (predictor.js: стакан, лента/CVD, OI, фандинг, ликвидации по WebSocket):
+//    вход только если P(цена через 5 мин в сторону сделки) ≥ predMin %; прогноз развернулся против — ожидающий вход снимается;
 //  • Live выкл — симуляция на живом стакане (комиссия мейкера 0.02 %).
 "use strict";
 
@@ -16,10 +18,10 @@ const DEF = { live: false, simEq: 100, budgetPct: 80, maxCoins: 6, lev: 3, minTu
   buf: 0.1, pull: 0.1, chaseMax: 1, entryTimeout: 60, requote: 2, minProfit: 0.2, slRR: 1, hardSl: 0, tp: 0.6, act: 0.35, trail: 0.2, cooldown: 3, dayStop: 10,
   coins: "", imb: 0.35, flow: 0.3, depthPct: 0.3, flowSec: 10, confirm: 2, maxSpread: 0.08, flipExit: true,
   aiOn: true, aiTune: true, aiEvery: 5, aiMinConf: 60, aiTuneHours: 6,
-  longOn: true, shortOn: true, btcFilter: false };
+  longOn: true, shortOn: true, btcFilter: false, predOn: true, predMin: 50 };
 const NUMS = ["simEq", "budgetPct", "maxCoins", "lev", "minTurn", "maxCand", "boxBars", "minBox", "maxBox", "buf", "pull", "chaseMax", "entryTimeout", "requote",
-  "minProfit", "slRR", "hardSl", "imb", "flow", "depthPct", "flowSec", "confirm", "maxSpread", "tp", "act", "trail", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours"];
-const BOOLS = ["live", "longOn", "shortOn", "btcFilter", "aiOn", "aiTune", "flipExit"];
+  "minProfit", "slRR", "hardSl", "imb", "flow", "depthPct", "flowSec", "confirm", "maxSpread", "tp", "act", "trail", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours", "predMin"];
+const BOOLS = ["live", "longOn", "shortOn", "btcFilter", "aiOn", "aiTune", "flipExit", "predOn"];
 // в каких рамках ИИ может менять параметры
 const AI_BOUNDS = { tp: [0.2, 2], act: [0.15, 1.5], trail: [0.05, 0.8], minProfit: [0.08, 0.8], imb: [0.15, 0.8], flow: [0.1, 0.9], depthPct: [0.1, 1], flowSec: [3, 60], confirm: [1, 5], maxSpread: [0.02, 0.3], cooldown: [0, 30] };
 const BLOCK = new Set(("SOXL SOXS UVXY TQQQ SQQQ MSTR NVDA AMDSTOCK AMD INTC MU MRVL CRWV NBIS SNDK SKHY SKHYNIX SAMSUNG SAMSUNGEM DRAM EWY TEM KORU MUU SNXX MSFU " +
@@ -28,6 +30,7 @@ const blocked = (sym) => { const b = sym.replace(/USDT$/, ""); return BLOCK.has(
 
 function create(host) {
   const { bx, lsGet, lsSet, keys } = host;
+  const PRED = host.pred || null;   // 📈 прогноз на 5 минут
   const now = () => Date.now(), sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const dayOf = (t) => new Date(t || now()).toISOString().slice(0, 10);
 
@@ -302,12 +305,12 @@ function create(host) {
     if (!cands.length) { AI.picks = {}; AI.at = now(); AI.err = ""; saveAi(); return; }
     const coins = cands.map(x => { const c = coin(x.sym); return { sym: x.sym.replace("USDT", ""), ch24hPct: x.ch24, range24hPct: +x.range24.toFixed(2), spreadPct: +x.spread.toFixed(3),
       bookImbalance: c.I != null ? +c.I.toFixed(2) : null, tradeFlow: c.F != null ? +c.F.toFixed(2) : null, flowUsd10s: c.flowUsd != null ? Math.round(c.flowUsd) : null,
-      depthUsd: c.depth != null ? Math.round(c.depth) : null, recent: tradeStats(x.sym) }; });
+      depthUsd: c.depth != null ? Math.round(c.depth) : null, pUp5m: (() => { const g = PRED ? PRED.get(x.sym) : null; return g && g.ready ? Math.round(g.pUp * 100) : null; })(), recent: tradeStats(x.sym) }; });
     const prompt = `You pick coins for a Bybit USDT-perpetual ORDER-BOOK scalper (no charts). Every ~1.5 s it reads the order book and the last trades of each picked coin.
 It goes LONG when book imbalance >= ${CFG.imb} (bids vs asks within ${CFG.depthPct}% of price) AND taker flow >= ${CFG.flow} over ${CFG.flowSec}s, ${CFG.confirm}x in a row; SHORT mirrored.
 Entry and exit only with maker limit orders at the front of the book. Exit: maker take +${CFG.tp}%, trailing from +${CFG.act}% (callback ${CFG.trail}%), exit when the book flips against; risk 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%). Leverage ${CFG.lev}x. Maker fees ~0.04% round trip.
 Goal: maximise trades that reach the take fast. Prefer liquid coins with tight spread, real depth and order flow that follows through; avoid thin books that get spoofed, coins in a one-way crash against the side, or coins that just lost money here.
-Coins (bookImbalance and tradeFlow −1..+1 right now; recent = this bot's last trades on the coin): ${JSON.stringify(coins)}
+Coins (bookImbalance and tradeFlow −1..+1 right now; pUp5m = our order-flow model's probability (%) that price is higher in 5 min, null if not computed; recent = this bot's last trades on the coin): ${JSON.stringify(coins)}
 Last trades overall: ${JSON.stringify(tradeStats().slice(0, 20))}
 Answer ONLY one JSON object: {"picks":[{"sym":"ABC","side":"long|short|both|none","conf":0-100,"why":"коротко по-русски"}],"note":"одна фраза по-русски о рынке"}. Include every coin.`;
     try {
@@ -354,6 +357,26 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     finally { tuning = false; }
   }
 
+  // ---------------- 📈 фильтр 5-мин прогноза ----------------
+  const PSTAT = Object.assign({ blocked: 0, cancelled: 0 }, lsGet("mb.pstat", {}));
+  const PLOG = {};
+  const predUse = () => !!(CFG.predOn && PRED);
+  const pSide = (g, side) => side === "Buy" ? g.pUp : 1 - g.pUp;
+  const dirWord = (side) => side === "Buy" ? "вверх" : "вниз";
+  // null — вход разрешён, иначе причина
+  function predBlock(sym, side) {
+    if (!predUse()) return null;
+    const g = PRED.get(sym);
+    if (!g.ready) return `прогноз 5м не готов (${g.why})`;
+    const ps = pSide(g, side) * 100;
+    return ps < CFG.predMin ? `прогноз 5м против: P(${dirWord(side)}) ${ps.toFixed(0)}% < ${CFG.predMin}%` : null;
+  }
+  function predLog(sym, msg, count) {   // в журнал не чаще раза в минуту на монету
+    if ((PLOG[sym] || 0) > now()) return;
+    PLOG[sym] = now() + 60000; log(msg);
+    if (count) { PSTAT.blocked++; lsSet("mb.pstat", PSTAT); }
+  }
+
   function wantEntry(c) {
     if (!running || DAY.paused || OPEN[c.sym] || (c.pos && c.pos.size > 0) || c.work) return null;
     if ((COOL[c.sym] || 0) > now() || !ACTIVE.includes(c.sym) || FOREIGN.has(c.sym) || !c.bookAt || now() - c.bookAt > 5000) return null;
@@ -365,14 +388,19 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       if (!a || a.conf < CFG.aiMinConf) return null;
       okL = okL && (a.side === "long" || a.side === "both"); okS = okS && (a.side === "short" || a.side === "both");
     }
-    if (manual()) {   // монета выбрана вручную — вхожу сразу, сторона по стакану и потоку прямо сейчас
-      const bias = (c.I || 0) + (c.F || 0);
+    let e = null;
+    if (manual()) {   // монета выбрана вручную — вхожу сразу, сторона по 5-мин прогнозу (если готов), иначе по стакану и потоку
+      const g = predUse() ? PRED.get(c.sym) : null;
+      const bias = g && g.ready ? g.pUp - 0.5 : (c.I || 0) + (c.F || 0);
       const side = okL && (bias >= 0 || !okS) ? "Buy" : okS ? "Sell" : null;
-      return side ? { side, level: side === "Buy" ? c.ask : c.bid } : null;
-    }
-    if (okL && c.sigL >= CFG.confirm) return { side: "Buy", level: c.ask };
-    if (okS && c.sigS >= CFG.confirm) return { side: "Sell", level: c.bid };
-    return null;
+      if (side) e = { side, level: side === "Buy" ? c.ask : c.bid };
+    } else if (okL && c.sigL >= CFG.confirm) e = { side: "Buy", level: c.ask };
+    else if (okS && c.sigS >= CFG.confirm) e = { side: "Sell", level: c.bid };
+    if (!e) return null;
+    const bad = predBlock(c.sym, e.side);
+    if (bad) { predLog(c.sym, `${c.sym}: 📈 ${word(e.side)} не открываю — ${bad} (${bookTxt(c)})`, !/не готов/.test(bad)); return null; }
+    e.pUp = predUse() ? PRED.get(c.sym).pUp : null;
+    return e;
   }
   const bookTxt = (c) => `стакан ${c.I >= 0 ? "+" : ""}${(c.I || 0).toFixed(2)} · поток ${c.F >= 0 ? "+" : ""}${(c.F || 0).toFixed(2)}`;
   // вход ещё актуален? (стакан за нас, цена рядом, время не вышло)
@@ -381,6 +409,10 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     const p = c.last, L = w.side === "Buy";
     if (L ? p > w.level * (1 + CFG.chaseMax / 100) : p < w.level * (1 - CFG.chaseMax / 100)) return "цена ушла";
     if (L ? (c.I < 0 && c.F < 0) : (c.I > 0 && c.F > 0)) return "стакан развернулся";
+    if (predUse()) {   // прогноз развернулся против (с запасом 5 %, чтобы не дёргаться у границы)
+      const g = PRED.get(c.sym);
+      if (g.ready && pSide(g, w.side) * 100 < CFG.predMin - 5) { PSTAT.cancelled++; lsSet("mb.pstat", PSTAT); return `прогноз 5м против (P ${dirWord(w.side)} ${(pSide(g, w.side) * 100).toFixed(0)}%)`; }
+    }
     return null;
   }
   function exitWhy(c, o) {
@@ -401,6 +433,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (fastBusy) return; fastBusy = true;
     try {
       const syms = [...new Set([...ACTIVE, ...Object.keys(OPEN), ...Object.keys(C).filter(s => C[s].work)])];
+      if (PRED) PRED.want(CFG.predOn ? syms : []);
       await Promise.all(syms.map(s => bookRead(s).catch(e => { coin(s).bookAt = 0; })));
       if (now() - eqAt > 15000) await equity();
       if (isLive()) await fastLive(); else fastSim();
@@ -452,7 +485,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
         const e = wantEntry(c);
         if (e) {
           await prep(sym);
-          c.work = { kind: "entry", side: e.side, level: e.level, start: now() };
+          c.work = { kind: "entry", side: e.side, level: e.level, start: now(), pUp: e.pUp }; c.pUp = e.pUp;
           log(`${sym}: ${manual() ? (e.side === "Buy" ? "▶ вручную, лонг" : "▶ вручную, шорт") : e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой у ${fmt(e.level)}`);
           await liveQuote(c, c.work);
         }
@@ -492,7 +525,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
 
   async function opened(c) {
     const sym = c.sym, p = c.pos;
-    OPEN[sym] = { side: p.side, open: now(), entry: p.avg, qty: p.size, live: true, best: p.avg, trailOn: false }; saveOpen();
+    OPEN[sym] = { side: p.side, open: now(), entry: p.avg, qty: p.size, live: true, best: p.avg, trailOn: false, pUp: c.pUp == null ? null : c.pUp }; saveOpen();
     log(`${sym}: ✅ ${word(p.side)} ${p.size} @ ${fmt(p.avg)} (мейкер)`, "ok");
     if (CFG.hardSl > 0) {
       const i = await inst(sym), L = p.side === "Buy";
@@ -517,7 +550,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
   }
 
   function finish(sym, o, exit, pnl, why) {
-    const tr = { sym, side: o.side, open: o.open, close: now(), entry: o.entry, exit, qty: o.qty, pnl: pnl == null ? null : +pnl.toFixed(4), why, live: !!o.live };
+    const tr = { sym, side: o.side, open: o.open, close: now(), entry: o.entry, exit, qty: o.qty, pnl: pnl == null ? null : +pnl.toFixed(4), why, live: !!o.live, pUp: o.pUp == null ? null : +(+o.pUp).toFixed(3) };
     TRADES.unshift(tr); saveTrades();
     delete OPEN[sym]; saveOpen();
     const c = coin(sym); c.pos = null; c.work = null;
@@ -540,7 +573,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       if (w && w.kind === "entry") {
         if (filled(w)) {
           const entry = w.px, qty = notional() / entry;
-          OPEN[sym] = { side: w.side, open: now(), entry, qty, live: false, best: entry, trailOn: false, fee: entry * qty * MAKER,
+          OPEN[sym] = { side: w.side, open: now(), entry, qty, live: false, best: entry, trailOn: false, fee: entry * qty * MAKER, pUp: w.pUp == null ? null : w.pUp,
             take: CFG.tp > 0 ? entry * (1 + (w.side === "Buy" ? 1 : -1) * CFG.tp / 100) : 0 };
           c.work = null; saveOpen();
           log(`${sym}: ✅ ${word(w.side)} @ ${fmt(entry)} (сим, мейкер) · тейк @ ${fmt(OPEN[sym].take)}`, "ok");
@@ -574,7 +607,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       c.pos = null;
       const e = wantEntry(c);
       if (e) {
-        c.work = { kind: "entry", side: e.side, level: e.level, start: now() }; requote(c.work);
+        c.work = { kind: "entry", side: e.side, level: e.level, start: now(), pUp: e.pUp }; c.pUp = e.pUp; requote(c.work);
         if (!INST[sym]) inst(sym).catch(() => {});
         log(`${sym}: ${manual() ? (e.side === "Buy" ? "▶ вручную, лонг" : "▶ вручную, шорт") : e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой @ ${fmt(c.work.px)} (сим)`);
       }
@@ -604,7 +637,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (CFG.live && !keys()) throw new Error("Нет BYBIT_API_KEY / BYBIT_API_SECRET — Live недоступен");
     running = true; lsSet("mb.running", true);
     await cleanStale();
-    log(`СТАРТ ${isLive() ? "LIVE" : "симуляция"} · по стакану, только лимитки-мейкеры: до ${CFG.maxCoins} монет · вход: стакан ≥ ${CFG.imb} и поток ≥ ${CFG.flow} (${CFG.flowSec} с) ${CFG.confirm}× подряд, спред ≤ ${CFG.maxSpread}% · тейк +${CFG.tp}% · трейлинг с +${CFG.act}% откат ${CFG.trail}% (≥ +${CFG.minProfit}%) · стоп 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%) · ${CFG.flipExit ? "выход при развороте стакана · " : ""}ИИ ${aiReady() ? "вкл" : "выкл"} · аварийный стоп ${CFG.hardSl || "выкл"}${CFG.hardSl ? "%" : ""} · плечо x${CFG.lev} · ${CFG.budgetPct}% депозита`, "ok");
+    log(`СТАРТ ${isLive() ? "LIVE" : "симуляция"} · по стакану, только лимитки-мейкеры: до ${CFG.maxCoins} монет · вход: стакан ≥ ${CFG.imb} и поток ≥ ${CFG.flow} (${CFG.flowSec} с) ${CFG.confirm}× подряд, спред ≤ ${CFG.maxSpread}% · тейк +${CFG.tp}% · трейлинг с +${CFG.act}% откат ${CFG.trail}% (≥ +${CFG.minProfit}%) · стоп 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%) · ${CFG.flipExit ? "выход при развороте стакана · " : ""}ИИ ${aiReady() ? "вкл" : "выкл"} · 📈 прогноз 5м ${predUse() ? "≥ " + CFG.predMin + "% в сторону сделки" : "выкл"} · аварийный стоп ${CFG.hardSl || "выкл"}${CFG.hardSl ? "%" : ""} · плечо x${CFG.lev} · ${CFG.budgetPct}% депозита`, "ok");
     loops(); scan();
     return isLive() ? "Запущено — LIVE" : "Запущено — симуляция";
   }
@@ -633,11 +666,13 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (x.coins != null) { const before = CFG.coins; CFG.coins = String(x.coins).slice(0, 500); if (before !== CFG.coins) setTimeout(scan, 100); }
     CFG.lev = Math.min(Math.max(1, CFG.lev), 10); CFG.maxCoins = Math.min(Math.max(1, Math.round(CFG.maxCoins)), 30);
     CFG.boxBars = Math.min(Math.max(3, Math.round(CFG.boxBars)), 200); CFG.budgetPct = Math.min(Math.max(5, CFG.budgetPct), 95);
+    CFG.predMin = Math.min(Math.max(0, CFG.predMin), 90);
     CFG.requote = Math.max(1, CFG.requote); CFG.entryTimeout = Math.max(3, CFG.entryTimeout);
     saveCfg();
     if (wasLive !== isLive()) { for (const c of Object.values(C)) { c.work = null; c.lev = false; c.pos = null; } }
   }
   function resetStats() { TRADES.length = 0; saveTrades(); return "Статистика очищена"; }
+  function predReset() { if (!PRED) return "Прогноз недоступен"; PRED.reset(); PSTAT.blocked = 0; PSTAT.cancelled = 0; lsSet("mb.pstat", PSTAT); return "📈 Обучение прогноза сброшено"; }
 
   function stats() {
     const d = dayOf(), mode = isLive();
@@ -653,11 +688,13 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       return { sym: s, last: c.last, I: c.I, F: c.F, spread: c.spread, flowUsd: c.flowUsd, sigL: c.sigL || 0, sigS: c.sigS || 0,
         work: c.work ? { kind: c.work.kind, side: c.work.side, px: c.work.px ? +c.work.px : null, why: c.work.why || null, n: c.work.n || 0 } : null,
         pos: c.pos && c.pos.size > 0 ? { side: c.pos.side, size: c.pos.size, avg: c.pos.avg, upnl: c.pos.upnl } : null,
-        trailOn: OPEN[s] ? !!OPEN[s].trailOn : false, cool: Math.max(0, (COOL[s] || 0) - now()) };
+        trailOn: OPEN[s] ? !!OPEN[s].trailOn : false, cool: Math.max(0, (COOL[s] || 0) - now()),
+        pred: (() => { if (!PRED || !CFG.predOn) return null; const g = PRED.get(s); return { ready: g.ready, pUp: g.pUp == null ? null : +g.pUp.toFixed(3), why: g.why || null, full: !!g.full }; })() };
     });
     const ai = { ready: aiReady(), hasKey: !!host.fal, fresh: aiFresh(), at: AI.at, note: AI.note, err: AI.err, tuneAt: AI.tuneAt, tuneNote: AI.tuneNote, picks: AI.picks };
     return { manual: manualList(), ai, running, live: isLive(), cfg: CFG, eq: EQ, avail: AVAIL, day: DAY, stats: stats(), coins, trades: TRADES.filter(t => t.live === isLive()).slice(0, 100),
-      log: LOG.slice(0, 200), lastScanAt, notional: notional(), btc: CFG.btcFilter ? BTC.why : null };
+      log: LOG.slice(0, 200), lastScanAt, notional: notional(), btc: CFG.btcFilter ? BTC.why : null,
+      pred: PRED ? Object.assign(PRED.stats(), { on: !!CFG.predOn, blocked: PSTAT.blocked, cancelled: PSTAT.cancelled }) : null };
   }
 
   (async () => {
@@ -666,7 +703,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     else if (Object.keys(OPEN).length) loops();
   })();
 
-  return { start, stop, closeAll, setCfg, resetStats, view };
+  return { start, stop, closeAll, setCfg, resetStats, predReset, view };
 }
 
 module.exports = { create, DEF, blocked };
