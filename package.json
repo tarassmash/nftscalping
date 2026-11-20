@@ -1,0 +1,12 @@
+{
+  "name": "breakout-mm",
+  "private": true,
+  "description": "Bybit breakout market-maker: conditional orders above/below a moving range, short trailing takes, 24/7 on a server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
