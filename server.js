@@ -60,8 +60,21 @@ async function bx(p, { method = "GET", query = null, body = null, auth = false }
 }
 async function syncTime() { try { const r = await bx("/v5/market/time"); OFFSET = Math.round(Number(r.timeNano) / 1e6) - Date.now(); } catch (e) { /* keep */ } }
 
+// ---------------- 🧠 fal.ai: нейросеть, которая выбирает сделки и подстраивает параметры (FAL_KEY в Railway) ----------------
+const FAL_KEY = (process.env.FAL_KEY || process.env.FAL_API_KEY || "").trim();
+const FAL_MODEL = (process.env.FAL_MODEL || "google/gemini-2.5-flash").trim();
+const FAL_URL = (process.env.TEST_FAL_URL || process.env.FAL_URL || "https://fal.run/fal-ai/any-llm").trim();
+async function fal(prompt, system) {
+  const r = await fetch(FAL_URL, { method: "POST", headers: { Authorization: "Key " + FAL_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: FAL_MODEL, system_prompt: system || "Answer only with one JSON object.", prompt, temperature: 0.2, max_tokens: 2000 }), signal: AbortSignal.timeout(60000) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error) throw new Error(`fal ${r.status}: ${j.error || j.detail || "ошибка"}`);
+  const m = String(j.output || "").match(/\{[\s\S]*\}/); if (!m) throw new Error("ИИ не вернул JSON");
+  return JSON.parse(m[0]);
+}
+
 // ---------------- the bot ----------------
-const BOT = require("./bot").create({ bx, lsGet, lsSet, keys: () => HAS_KEYS, log: (m) => log("bot", m) });
+const BOT = require("./bot").create({ bx, lsGet, lsSet, keys: () => HAS_KEYS, log: (m) => log("bot", m), fal: FAL_KEY ? fal : null });
 
 function state() { return { env: ENV, keys: HAS_KEYS, password: !!PASSWORD, bot: BOT.view() }; }
 async function act(b) {
@@ -110,7 +123,7 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
     return res.end(UI);
   } catch (e) { return json(500, { error: String(e && e.message || e) }); }
-}).listen(PORT, "0.0.0.0", () => log(`BREAKOUT MM :${PORT} · ${ENV} · Bybit keys ${HAS_KEYS ? "yes" : "NO"} · ${PASSWORD ? "password on" : "NO UI_PASSWORD (buttons locked)"} · storage ${STORE}`));
+}).listen(PORT, "0.0.0.0", () => log(`BREAKOUT MM :${PORT} · ${ENV} · Bybit keys ${HAS_KEYS ? "yes" : "NO"} · ${PASSWORD ? "password on" : "NO UI_PASSWORD (buttons locked)"} · AI ${FAL_KEY ? FAL_MODEL : "OFF (нет FAL_KEY)"} · storage ${STORE}`));
 
 process.on("unhandledRejection", (e) => log("unhandledRejection", e && e.message || e));
 process.on("uncaughtException", (e) => log("uncaughtException", e && e.stack || e));

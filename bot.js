@@ -11,9 +11,12 @@
 const PFX = "mb_";   // все ордера этого бота: mb_e… вход
 const FEE = 0.00055;
 const DEF = { live: false, simEq: 100, budgetPct: 80, maxCoins: 6, lev: 3, minTurn: 5, maxCand: 40, boxBars: 15, minBox: 0.4, maxBox: 4,
+  aiOn: true, aiTune: true, aiEvery: 5, aiMinConf: 60, aiTuneHours: 6,
   buf: 0.1, slip: 0.15, sl: 0.8, act: 0.5, trail: 0.3, tpMax: 3, cooldown: 3, dayStop: 10, longOn: true, shortOn: true, btcFilter: false };
-const NUMS = ["simEq", "budgetPct", "maxCoins", "lev", "minTurn", "maxCand", "boxBars", "minBox", "maxBox", "buf", "slip", "sl", "act", "trail", "tpMax", "cooldown", "dayStop"];
-const BOOLS = ["live", "longOn", "shortOn", "btcFilter"];
+const NUMS = ["simEq", "budgetPct", "maxCoins", "lev", "minTurn", "maxCand", "boxBars", "minBox", "maxBox", "buf", "slip", "sl", "act", "trail", "tpMax", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours"];
+const BOOLS = ["live", "longOn", "shortOn", "btcFilter", "aiOn", "aiTune"];
+// в каких рамках ИИ может менять параметры
+const AI_BOUNDS = { sl: [0.4, 2], act: [0.2, 2], trail: [0.1, 1], tpMax: [0.5, 6], minBox: [0.2, 2], maxBox: [1, 8], buf: [0, 0.5], boxBars: [5, 60], cooldown: [0, 30] };
 // токенизированные акции, ETF, металлы, стейблы — у них гэпы и другая природа движения
 const BLOCK = new Set(("SOXL SOXS UVXY TQQQ SQQQ MSTR NVDA AMDSTOCK AMD INTC MU MRVL CRWV NBIS SNDK SKHY SKHYNIX SAMSUNG SAMSUNGEM DRAM EWY TEM KORU MUU SNXX MSFU " +
   "AGPU CRCL SPCX OKTA LITE CBRS TSLA AAPL GOOGL AMZN META MSFT COIN HOOD PLTR NFLX SPY QQQ XAU XAG PAXG XAUT USDC USDE FDUSD DAI TUSD BUSD USD1 RLUSD PYUSD").split(" "));
@@ -43,6 +46,10 @@ function create(host) {
     host.log && host.log(msg);
   }
   const isLive = () => !!(CFG.live && keys());
+  const AI = Object.assign({ at: 0, picks: {}, note: "", err: "", tuneAt: now(), tuneNote: "", tuneN: 0, calls: 0 }, lsGet("mb.ai", {}));
+  const saveAi = () => lsSet("mb.ai", AI);
+  const aiReady = () => !!(CFG.aiOn && host.fal);
+  const aiFresh = () => aiReady() && now() - AI.at < Math.max(3, CFG.aiEvery * 3) * 60000 && !AI.err;
 
   // ---------------- Bybit ----------------
   const pub = (p, q) => bx(p, { query: q });
@@ -116,6 +123,7 @@ function create(host) {
       const t = await pub("/v5/market/tickers", { category: "linear" });
       const rows = (t.list || []).filter(x => /USDT$/.test(x.symbol) && !blocked(x.symbol) && +x.turnover24h >= CFG.minTurn * 1e6 && +x.lastPrice > 0);
       for (const x of rows) if (C[x.symbol]) C[x.symbol].last = +x.lastPrice;
+      const ch24 = {}; for (const x of rows) ch24[x.symbol] = +(+x.price24hPcnt * 100).toFixed(2);
       const cand = rows.sort((a, b) => Math.abs(+b.price24hPcnt) - Math.abs(+a.price24hPcnt)).slice(0, CFG.maxCand).map(x => x.symbol);
       const held = Object.keys(C).filter(s => C[s].pos && C[s].pos.size > 0);
       const want = [...new Set([...cand, ...held, ...ACTIVE])];
@@ -129,23 +137,94 @@ function create(host) {
             const past = bars.slice(1, CFG.boxBars + 1);
             const hi = Math.max(...past.map(b => b.h)), lo = Math.min(...past.map(b => b.l)), mid = (hi + lo) / 2;
             const atr = past.reduce((a, b) => a + (b.h - b.l) / b.c * 100, 0) / past.length;
-            return { sym, hi, lo, box: (hi - lo) / mid * 100, atr, last: bars[0].c };
+            return { sym, hi, lo, box: (hi - lo) / mid * 100, atr, last: bars[0].c, closes: bars.slice(0, CFG.boxBars + 1).map(b => b.c).reverse() };
           } catch (e) { return null; }
         }));
         info.push(...part.filter(Boolean));
       }
       for (const x of info) Object.assign(coin(x.sym), { hi: x.hi, lo: x.lo, box: x.box, atr: x.atr, last: x.last });
       const ok = info.filter(x => x.box >= CFG.minBox && x.box <= CFG.maxBox && !FOREIGN.has(x.sym)).sort((a, b) => b.atr - a.atr);
-      const next = ok.slice(0, CFG.maxCoins).map(x => x.sym);
+      if (CFG.btcFilter || aiReady()) await btcTrend();
+      let next = ok.slice(0, CFG.maxCoins).map(x => x.sym);
+      if (aiReady()) {
+        if (now() - AI.at >= CFG.aiEvery * 60000 || AI.err) await aiDecide(ok.slice(0, Math.max(CFG.maxCoins * 2, 8)), ch24);
+        if (aiFresh()) next = ok.filter(x => AI.picks[x.sym] && AI.picks[x.sym].side !== "none" && AI.picks[x.sym].conf >= CFG.aiMinConf)
+          .sort((a, b) => AI.picks[b.sym].conf - AI.picks[a.sym].conf).slice(0, CFG.maxCoins).map(x => x.sym);
+      }
+      if (aiReady() && CFG.aiTune) aiTuneMaybe();
       for (const s of held) if (!next.includes(s)) next.push(s);
       const gone = ACTIVE.filter(s => !next.includes(s)), added = next.filter(s => !ACTIVE.includes(s));
       ACTIVE = next; lastScanAt = now();
       if (added.length || gone.length) log(`Скан: ${ACTIVE.map(s => s.replace("USDT", "")).join(", ") || "нет подходящих"}${added.length ? " · + " + added.join(", ") : ""}${gone.length ? " · − " + gone.join(", ") : ""}`);
       for (const s of gone) await clearEntries(s);
-      if (CFG.btcFilter) await btcTrend();
       for (const s of ACTIVE) { try { await place(s); } catch (e) { log(`${s}: ${e.message}`, "err"); } }
     } catch (e) { log("скан: " + e.message, "err"); }
     finally { scanBusy = false; }
+  }
+
+  // ---------------- 🧠 ИИ: какие монеты и в какую сторону торговать ----------------
+  function tradeStats(sym) {
+    const a = TRADES.filter(t => t.live === isLive() && t.pnl != null && (!sym || t.sym === sym)).slice(0, sym ? 10 : 40);
+    return a.map(t => ({ sym: t.sym.replace("USDT", ""), side: t.side === "Buy" ? "long" : "short", pnl: +t.pnl.toFixed(3), why: t.why, min: Math.round((t.close - t.open) / 60000), agoMin: Math.round((now() - t.close) / 60000) }));
+  }
+  async function aiDecide(cands, ch24) {
+    if (!cands.length) { AI.picks = {}; AI.at = now(); AI.err = ""; saveAi(); return; }
+    const coins = cands.map(x => {
+      const pos = (x.last - x.lo) / Math.max(1e-12, x.hi - x.lo);
+      return { sym: x.sym.replace("USDT", ""), boxPct: +x.box.toFixed(2), atr1mPct: +x.atr.toFixed(2), posInBox: +pos.toFixed(2), ch24hPct: ch24[x.sym],
+        closes1m: x.closes.map(v => +((v / x.closes[0] - 1) * 100).toFixed(2)), recent: tradeStats(x.sym) };
+    });
+    const prompt = `You pick trades for a Bybit USDT-perpetual BREAKOUT scalper. For each coin the bot keeps a range = high/low of the last ${CFG.boxBars} one-minute candles.
+It enters LONG with a stop order ${CFG.buf}% above the range high, SHORT ${CFG.buf}% below the range low (conditional market order).
+Exit: exchange stop ${CFG.sl}% against, trailing stop starting at +${CFG.act}% with ${CFG.trail}% callback, hard take +${CFG.tpMax}%. Leverage ${CFG.lev}x. Fees ~0.11% round trip.
+Goal: maximise expected profit after fees. Prefer coins whose breakouts follow through (trend, momentum, compression before breakout) and avoid choppy fake-out coins or those that just lost money here.
+BTC 5m trend: ${BTC.why}.
+Coins (closes1m = % change of each 1m close vs the first, oldest first; posInBox 0 = at low, 1 = at high; recent = this bot's last trades on the coin):
+${JSON.stringify(coins)}
+Last trades overall: ${JSON.stringify(tradeStats().slice(0, 20))}
+Answer ONLY one JSON object: {"picks":[{"sym":"ABC","side":"long|short|both|none","conf":0-100,"why":"коротко по-русски"}],"note":"одна фраза по-русски о рынке"}. Include every coin.`;
+    try {
+      const j = await host.fal(prompt, "You are a disciplined crypto scalping risk manager. Answer only with one JSON object.");
+      const picks = {};
+      for (const p of (j.picks || [])) {
+        const sym = String(p.sym || "").toUpperCase().replace(/USDT$/, "") + "USDT";
+        const side = ["long", "short", "both", "none"].includes(p.side) ? p.side : "none";
+        picks[sym] = { side, conf: Math.max(0, Math.min(100, +p.conf || 0)), why: String(p.why || "").slice(0, 140) };
+      }
+      AI.picks = picks; AI.note = String(j.note || "").slice(0, 200); AI.at = now(); AI.err = ""; AI.calls++; saveAi();
+      const yes = Object.entries(picks).filter(([, p]) => p.side !== "none" && p.conf >= CFG.aiMinConf);
+      log(`🧠 ИИ: ${yes.length ? yes.map(([s, p]) => `${s.replace("USDT", "")} ${p.side === "long" ? "↑" : p.side === "short" ? "↓" : "↕"}${p.conf}`).join(", ") : "сейчас не торговать"}${AI.note ? " · " + AI.note : ""}`);
+    } catch (e) {
+      AI.err = e.message; AI.at = now(); saveAi();
+      log(`🧠 ИИ недоступен (${e.message}) — торгую по обычным правилам`, "err");
+    }
+  }
+  let tuning = false;
+  async function aiTuneMaybe() {
+    if (tuning || now() - (AI.tuneAt || 0) < CFG.aiTuneHours * 3600000) return;
+    const since = TRADES.filter(t => t.live === isLive() && t.pnl != null && t.close > (AI.tuneAt || 0));
+    if (since.length < 10) return;
+    tuning = true;
+    try {
+      const cur = {}; for (const k of Object.keys(AI_BOUNDS)) cur[k] = CFG[k];
+      const sum = since.reduce((a, t) => a + t.pnl, 0), byWhy = {};
+      for (const t of since) { const w = byWhy[t.why] || (byWhy[t.why] = { n: 0, pnl: 0 }); w.n++; w.pnl = +(w.pnl + t.pnl).toFixed(3); }
+      const prompt = `Tune a Bybit breakout scalper. Current params: ${JSON.stringify(cur)}. Allowed ranges: ${JSON.stringify(AI_BOUNDS)}.
+Meaning: sl = stop %, act = trailing activation %, trail = trailing callback %, tpMax = hard take %, minBox/maxBox = allowed range width %, buf = entry offset beyond range %, boxBars = range length in 1m candles, cooldown = minutes before re-entering a coin.
+Since the last tuning: ${since.length} trades, total PnL ${sum.toFixed(3)} USDT, by exit reason ${JSON.stringify(byWhy)}. Trades: ${JSON.stringify(tradeStats().slice(0, 40))}.
+Change at most 3 params, small steps, only if the data supports it. Answer ONLY JSON: {"set":{"param":value},"why":"коротко по-русски"}.`;
+      const j = await host.fal(prompt, "You are a careful quant tuning a trading bot. Answer only with one JSON object.");
+      const ch = [];
+      for (const [k, v] of Object.entries(j.set || {})) {
+        if (!AI_BOUNDS[k] || !Number.isFinite(+v)) continue;
+        const [lo, hi] = AI_BOUNDS[k], nv = +Math.min(hi, Math.max(lo, +v)).toFixed(k === "boxBars" || k === "cooldown" ? 0 : 2);
+        if (nv !== CFG[k]) { ch.push(`${k} ${CFG[k]}→${nv}`); CFG[k] = nv; }
+      }
+      saveCfg();
+      AI.tuneAt = now(); AI.tuneN++; AI.tuneNote = (ch.length ? ch.join(", ") : "без изменений") + (j.why ? " · " + String(j.why).slice(0, 200) : ""); saveAi();
+      log(`🧠 ИИ-настройка по ${since.length} сделкам (${sum >= 0 ? "+" : ""}${sum.toFixed(2)} USDT): ${AI.tuneNote}`, "ok");
+    } catch (e) { log("🧠 ИИ-настройка: " + e.message, "err"); }
+    finally { tuning = false; }
   }
 
   // где должны стоять входы монеты сейчас (null — не ставить)
@@ -155,7 +234,13 @@ function create(host) {
     if ((COOL[c.sym] || 0) > now()) return {};
     if (!ACTIVE.includes(c.sym) || !c.hi || !(c.box >= CFG.minBox && c.box <= CFG.maxBox)) return {};
     const t = {};
-    const okLong = CFG.longOn && (!CFG.btcFilter || !BTC.down), okShort = CFG.shortOn && (!CFG.btcFilter || !BTC.up);
+    let okLong = CFG.longOn && (!CFG.btcFilter || !BTC.down), okShort = CFG.shortOn && (!CFG.btcFilter || !BTC.up);
+    if (aiFresh()) {   // ИИ решает сторону: long / short / both / none
+      const p = AI.picks[c.sym];
+      if (!p || p.conf < CFG.aiMinConf) return {};
+      okLong = okLong && (p.side === "long" || p.side === "both");
+      okShort = okShort && (p.side === "short" || p.side === "both");
+    }
     const up = c.hi * (1 + CFG.buf / 100), dn = c.lo * (1 - CFG.buf / 100);
     if (okLong && c.last < up * 0.9995) t.Buy = up;      // цена уже за уровнем — не догоняю, жду новый коридор
     if (okShort && c.last > dn * 1.0005) t.Sell = dn;
@@ -425,7 +510,8 @@ function create(host) {
         pos: c.pos && c.pos.size > 0 ? { side: c.pos.side, size: c.pos.size, avg: c.pos.avg, upnl: c.pos.upnl } : null,
         trailOn: OPEN[s] ? !!OPEN[s].trailOn : false, cool: Math.max(0, (COOL[s] || 0) - now()) };
     });
-    return { running, live: isLive(), cfg: CFG, eq: EQ, avail: AVAIL, day: DAY, stats: stats(), coins, trades: TRADES.filter(t => t.live === isLive()).slice(0, 100),
+    const ai = { ready: aiReady(), hasKey: !!host.fal, fresh: aiFresh(), at: AI.at, note: AI.note, err: AI.err, tuneAt: AI.tuneAt, tuneNote: AI.tuneNote, picks: AI.picks };
+    return { ai, running, live: isLive(), cfg: CFG, eq: EQ, avail: AVAIL, day: DAY, stats: stats(), coins, trades: TRADES.filter(t => t.live === isLive()).slice(0, 100),
       log: LOG.slice(0, 200), lastScanAt, notional: notional(), btc: CFG.btcFilter ? BTC.why : null };
   }
 

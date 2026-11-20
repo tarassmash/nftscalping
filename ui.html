@@ -64,6 +64,14 @@
     <div class="row liverow"><label style="color:var(--red)"><b>Live — реальная торговля</b></label><input type="checkbox" id="live"></div>
     <div class="note" id="keysNote"></div>
 
+    <h2>🧠 Нейросеть</h2>
+    <div class="row"><label>ИИ выбирает монеты и сторону</label><input type="checkbox" id="aiOn"></div>
+    <div class="row"><label>Спрашивать каждые, мин</label><input type="number" id="aiEvery" min="1" step="1"></div>
+    <div class="row"><label>Мин. уверенность ИИ, %</label><input type="number" id="aiMinConf" min="0" max="100" step="5"></div>
+    <div class="row"><label>ИИ подстраивает параметры</label><input type="checkbox" id="aiTune"></div>
+    <div class="row"><label>Подстройка раз в, часов</label><input type="number" id="aiTuneHours" min="1" step="1"></div>
+    <div class="note" id="aiNote"></div>
+
     <h2>Монеты</h2>
     <div class="row"><label>Монет одновременно</label><input type="number" id="maxCoins" min="1" max="30" step="1"></div>
     <div class="row"><label>Оборот 24ч от, млн USDT</label><input type="number" id="minTurn" min="0" step="1"></div>
@@ -112,8 +120,8 @@
     <div class="panel">
       <h2>Монеты <span class="mut" id="scanAt" style="text-transform:none;letter-spacing:0"></span></h2>
       <div class="tbl"><table>
-        <thead><tr><th>Монета</th><th>Цена</th><th>Коридор</th><th>Ширина</th><th>Волат. 1м</th><th>BUY выше</th><th>SELL ниже</th><th>Позиция</th><th>PnL</th></tr></thead>
-        <tbody id="coins"><tr><td colspan="9" class="mut">—</td></tr></tbody>
+        <thead><tr><th>Монета</th><th>Цена</th><th>Коридор</th><th>Ширина</th><th>Волат. 1м</th><th>BUY выше</th><th>SELL ниже</th><th>ИИ</th><th>Позиция</th><th>PnL</th></tr></thead>
+        <tbody id="coins"><tr><td colspan="10" class="mut">—</td></tr></tbody>
       </table></div>
     </div>
 
@@ -134,8 +142,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const NUMS = ["maxCoins","minTurn","maxCand","boxBars","minBox","maxBox","buf","slip","sl","act","trail","tpMax","cooldown","lev","budgetPct","dayStop","simEq"];
-const BOOLS = ["live","longOn","shortOn","btcFilter"];
+const NUMS = ["maxCoins","minTurn","maxCand","boxBars","minBox","maxBox","buf","slip","sl","act","trail","tpMax","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
+const BOOLS = ["live","longOn","shortOn","btcFilter","aiOn","aiTune"];
 let filled = false, editing = false;
 const f = (v, d) => v == null || !isFinite(v) ? "—" : (+v).toFixed(d == null ? 2 : d);
 const p = (v) => v == null || !isFinite(+v) ? "—" : String(+(+v).toPrecision(6));
@@ -166,8 +174,19 @@ $("bStart").onclick = () => act("start"); $("bStop").onclick = () => act("stop")
 $("bTest").onclick = () => act("test"); $("bClose").onclick = () => act("closeAll");
 $("bReset").onclick = () => { if (confirm("Очистить статистику сделок?")) act("reset"); };
 
+function aiCell(ai, sym) {
+  const x = ai && ai.picks && ai.picks[sym];
+  if (!ai || !ai.fresh || !x) return "<span class='mut'>—</span>";
+  const arrow = x.side === "long" ? "↑ лонг" : x.side === "short" ? "↓ шорт" : x.side === "both" ? "↕ обе" : "пропуск";
+  const c = x.side === "long" ? "up" : x.side === "short" ? "dn" : x.side === "both" ? "" : "mut";
+  return `<span class="${c}" title="${(x.why || "").replace(/"/g, "&quot;")}">${arrow} ${x.conf}%</span>`;
+}
 function render(s) {
   const b = s.bot;
+  const ai = b.ai || {};
+  $("aiNote").innerHTML = !ai.hasKey ? "<span class='dn'>Нет FAL_KEY — нейросеть выключена</span>"
+    : (ai.err ? `<span class='dn'>ИИ: ${ai.err}</span>` : (ai.at ? `Решение ${tm(ai.at)}${ai.note ? " · " + ai.note : ""}` : "ждёт первого скана"))
+      + (ai.tuneNote ? `<br>Последняя подстройка: ${ai.tuneNote}` : "");
   if (!filled || !editing) { for (const k of NUMS) if (document.activeElement !== $(k)) $(k).value = b.cfg[k]; for (const k of BOOLS) $(k).checked = !!b.cfg[k]; filled = true; }
   $("modeBadge").textContent = b.live ? "LIVE" : "СИМУЛЯЦИЯ"; $("modeBadge").className = "badge" + (b.live ? " live" : "");
   $("runBadge").textContent = b.running ? "РАБОТАЕТ" : "СТОП"; $("runBadge").className = "badge" + (b.running ? " on" : "");
@@ -187,8 +206,8 @@ function render(s) {
     const pos = c.pos ? `<span class="${c.pos.side === "Buy" ? "up" : "dn"}">${c.pos.side === "Buy" ? "лонг" : "шорт"} ${p(c.pos.size)} @ ${p(c.pos.avg)}</span>${c.trailOn ? " 🎯" : ""}` : (c.cool ? `<span class="mut">пауза ${Math.ceil(c.cool / 60000)} мин</span>` : "<span class='mut'>—</span>");
     return `<tr><td><b>${c.sym.replace("USDT", "")}</b></td><td>${p(c.last)}</td><td>${p(c.lo)} – ${p(c.hi)}</td><td>${f(c.box)}%</td><td>${f(c.atr, 2)}%</td>
       <td class="up">${c.buy ? p(c.buy) : "<span class='mut'>—</span>"}</td><td class="dn">${c.sell ? p(c.sell) : "<span class='mut'>—</span>"}</td>
-      <td>${pos}</td><td class="${c.pos ? cls(c.pos.upnl) : "mut"}">${c.pos ? sgn(c.pos.upnl, 3) : "—"}</td></tr>`;
-  }).join("") : `<tr><td colspan="9" class="mut">${b.running ? "жду скан…" : "бот остановлен"}</td></tr>`;
+      <td>${aiCell(b.ai, c.sym)}</td><td>${pos}</td><td class="${c.pos ? cls(c.pos.upnl) : "mut"}">${c.pos ? sgn(c.pos.upnl, 3) : "—"}</td></tr>`;
+  }).join("") : `<tr><td colspan="10" class="mut">${b.running ? "жду скан…" : "бот остановлен"}</td></tr>`;
   $("trades").innerHTML = b.trades.length ? b.trades.map(t => `<tr><td><b>${t.sym.replace("USDT", "")}</b></td>
     <td class="${t.side === "Buy" ? "up" : "dn"}">${t.side === "Buy" ? "лонг" : "шорт"}</td><td>${p(t.entry)}</td><td>${p(t.exit)}</td><td>${t.why}</td>
     <td>${dur(t.close - t.open)}</td><td class="${cls(t.pnl)}">${t.pnl == null ? "—" : sgn(t.pnl, 3)}</td><td class="mut">${tm(t.close)}</td></tr>`).join("")
