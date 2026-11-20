@@ -155,15 +155,25 @@
 const $ = (id) => document.getElementById(id);
 const NUMS = ["maxCoins","minTurn","maxCand","imb","flow","depthPct","flowSec","confirm","maxSpread","chaseMax","entryTimeout","requote","minProfit","slRR","hardSl","tp","act","trail","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
 const BOOLS = ["live","longOn","shortOn","btcFilter","aiOn","aiTune","flipExit"];
-let filled = false, editing = false;
+let filled = false;
+const DIRTY = new Set();   // поля, которые пользователь изменил и которые ещё не подтверждены сервером — их не перезаписываю
 const f = (v, d) => v == null || !isFinite(v) ? "—" : (+v).toFixed(d == null ? 2 : d);
 const p = (v) => v == null || !isFinite(+v) ? "—" : String(+(+v).toPrecision(6));
 const sgn = (v, d) => v == null ? "—" : (v >= 0 ? "+" : "") + (+v).toFixed(d == null ? 2 : d);
 const cls = (v) => v > 0 ? "up" : v < 0 ? "dn" : "mut";
 const tm = (t) => new Date(t).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const dur = (ms) => { const m = Math.round(ms / 60000); return m < 60 ? m + " мин" : Math.floor(m / 60) + " ч " + (m % 60) + " мин"; };
-document.addEventListener("focusin", (e) => { if (e.target.tagName === "INPUT") editing = true; });
-document.addEventListener("focusout", () => { editing = false; });
+// любое изменение поля сразу сохраняется на сервер (через 0.6 с после последнего ввода)
+let saveTimer = null;
+function markDirty(e) {
+  const id = e.target && e.target.id; if (!id || e.target.tagName !== "INPUT") return;
+  if (id === "live" && e.type === "change" && e.target.checked && !confirm("Включить РЕАЛЬНУЮ торговлю на Bybit?")) { e.target.checked = false; return; }
+  if (id === "live" && e.type === "input") return;   // галочка Live сохраняется только по change (после подтверждения)
+  DIRTY.add(id);
+  clearTimeout(saveTimer); saveTimer = setTimeout(() => act("save", true), e.type === "change" ? 50 : 600);
+}
+document.addEventListener("input", markDirty);
+document.addEventListener("change", markDirty);
 
 function cfg() {
   const o = {};
@@ -172,14 +182,17 @@ function cfg() {
   o.coins = $("coins").value;
   return o;
 }
-async function act(what) {
-  if (what === "closeAll" && !confirm("Закрыть все позиции этого бота по рынку?")) return;
+async function act(what, quiet) {
+  if (what === "closeAll" && !confirm("Закрыть все позиции этого бота сейчас?")) return;
   if (what === "start" && $("live").checked && !confirm("Запустить РЕАЛЬНУЮ торговлю на Bybit?")) return;
-  $("msg").textContent = "…"; $("msg").className = "mut";
+  clearTimeout(saveTimer);
+  const sent = new Set(DIRTY);
+  if (!quiet) { $("msg").textContent = "…"; $("msg").className = "mut"; }
   try {
     const r = await (await fetch("/api/act", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ what, cfg: cfg() }) })).json();
-    $("msg").textContent = r.error || r.text; $("msg").className = r.error ? "dn" : "up";
-  } catch (e) { $("msg").textContent = e.message; $("msg").className = "dn"; }
+    if (!r.error) for (const k of sent) DIRTY.delete(k);
+    $("msg").textContent = r.error || (quiet ? "✓ Сохранено" : r.text); $("msg").className = r.error ? "dn" : "up";
+  } catch (e) { $("msg").textContent = "Не сохранилось: " + e.message; $("msg").className = "dn"; }
   refresh();
 }
 $("coins").addEventListener("keydown", (e) => { if (e.key === "Enter") act("save"); });
@@ -200,7 +213,11 @@ function render(s) {
   $("aiNote").innerHTML = !ai.hasKey ? "<span class='dn'>Нет FAL_KEY — нейросеть выключена</span>"
     : (ai.err ? `<span class='dn'>ИИ: ${ai.err}</span>` : (ai.at ? `Решение ${tm(ai.at)}${ai.note ? " · " + ai.note : ""}` : "ждёт первого скана"))
       + (ai.tuneNote ? `<br>Последняя подстройка: ${ai.tuneNote}` : "");
-  if (!filled || !editing) { for (const k of NUMS) if (document.activeElement !== $(k)) $(k).value = b.cfg[k]; for (const k of BOOLS) $(k).checked = !!b.cfg[k]; if (document.activeElement !== $("coins")) $("coins").value = b.cfg.coins || ""; filled = true; }
+  const keep = (id) => DIRTY.has(id) || document.activeElement === $(id);
+  for (const k of NUMS) if (!keep(k)) $(k).value = b.cfg[k];
+  for (const k of BOOLS) if (!keep(k)) $(k).checked = !!b.cfg[k];
+  if (!keep("coins")) $("coins").value = b.cfg.coins || "";
+  filled = true;
   $("coinsNote").textContent = b.manual && b.manual.length ? "Торгую только: " + b.manual.map(x => x.replace("USDT", "")).join(", ") + " — вход сразу, сторона по стакану, после выхода перезаход через 10 с" : "Бот сам выбирает монеты";
   $("modeBadge").textContent = b.live ? "LIVE" : "СИМУЛЯЦИЯ"; $("modeBadge").className = "badge" + (b.live ? " live" : "");
   $("runBadge").textContent = b.running ? "РАБОТАЕТ" : "СТОП"; $("runBadge").className = "badge" + (b.running ? " on" : "");

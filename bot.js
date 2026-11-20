@@ -630,7 +630,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     const wasLive = isLive();
     for (const k of NUMS) if (x[k] != null && x[k] !== "" && Number.isFinite(+x[k])) CFG[k] = +x[k];
     for (const k of BOOLS) if (x[k] != null) CFG[k] = !!x[k];
-    if (x.coins != null) { const before = CFG.coins; CFG.coins = String(x.coins).slice(0, 500); if (before !== CFG.coins && running) setTimeout(scan, 100); }
+    if (x.coins != null) { const before = CFG.coins; CFG.coins = String(x.coins).slice(0, 500); if (before !== CFG.coins) setTimeout(scan, 100); }
     CFG.lev = Math.min(Math.max(1, CFG.lev), 10); CFG.maxCoins = Math.min(Math.max(1, Math.round(CFG.maxCoins)), 30);
     CFG.boxBars = Math.min(Math.max(3, Math.round(CFG.boxBars)), 200); CFG.budgetPct = Math.min(Math.max(5, CFG.budgetPct), 95);
     CFG.requote = Math.max(1, CFG.requote); CFG.entryTimeout = Math.max(3, CFG.entryTimeout);
