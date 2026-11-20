@@ -1,29 +1,27 @@
-// Маркет-мейкер на пробоях — серверный движок, торгует 24/7. Только лимитки-мейкеры (PostOnly): вход и выход без маркета.
-//  • раз в минуту: скан USDT-перпов → самые волатильные монеты (средний диапазон минутных свечей), без акций/ETF/стейблов;
-//  • у каждой монеты коридор последних boxBars минут (high/low без текущей свечи), уровни: hi + buf %, lo − buf %;
-//  • цена пробила уровень → PostOnly-лимитка на уровне или на pull % за ценой (ловит ретест), каждые requote сек подтягивается
-//    вслед за ценой; цена ушла дальше chaseMax % от уровня, вернулась в коридор или прошло entryTimeout сек — вход отменён;
-//  • после входа сразу стоит лимитка тейка +tp % (мейкер, исполняется, когда цена идёт в нашу сторону);
-//  • ВЫХОД ТОЛЬКО В ПЛЮС: стопа нет; трейлинг (с +act %, откат trail %) — выход PostOnly-лимиткой, догоняющей цену,
-//    но никогда ниже входа + minProfit % (лимитка ждёт на этом уровне, пока цена вернётся);
-//  • риск 1:1 — минус по позиции не больше тейка: при −tp×slRR % выход лимиткой с догоном (slRR 0 = без стопа);
-//  • 🧠 нейросеть (fal.ai) каждые aiEvery мин выбирает монеты и сторону, раз в aiTuneHours ч подстраивает параметры;
-//  • страховка на случай падения сервера: аварийный стоп hardSl % на бирже (0 = выкл) — далеко, в обычной работе не срабатывает;
-//  • одна позиция на монету, пауза после выхода, защита дня: при −dayStop % от депозита на начало дня новые входы не ставятся;
-//  • Live выкл — симуляция на живых ценах (комиссия мейкера 0.02 %).
+// Скальпер по стакану — серверный движок, торгует 24/7. Только лимитки-мейкеры (PostOnly), без маркета.
+//  • раз в минуту: скан USDT-перпов по тикерам (оборот, размах за сутки, узкий спред), без акций/ETF/стейблов; 🧠 нейросеть выбирает монеты и сторону;
+//  • каждые ~1.5 с по каждой монете: стакан (50 уровней) и последние сделки — без свечей, сигнал раньше графика:
+//      дисбаланс стакана I = (заявки на покупку − на продажу) / сумма в пределах depthPct % от цены,
+//      поток F = (агрессивные покупки − продажи) / сумма за последние flowSec сек;
+//  • вход: I ≥ imb и F ≥ flow (шорт — наоборот) confirm раз подряд, спред ≤ maxSpread % → PostOnly-лимитка в начало стакана, догоняет цену;
+//    стакан развернулся, цена ушла дальше chaseMax % или прошло entryTimeout сек — вход отменён;
+//  • выход: лимитка тейка +tp %; трейлинг (с +act %, откат trail %, не хуже +minProfit %); стакан развернулся против — выход лимиткой;
+//    риск 1:slRR — при −tp×slRR % выход лимиткой с догоном; аварийный стоп hardSl % на бирже (0 = выкл);
+//  • Live выкл — симуляция на живом стакане (комиссия мейкера 0.02 %).
 "use strict";
 
 const PFX = "mb_";
 const MAKER = 0.0002, TAKER = 0.00055;
 const DEF = { live: false, simEq: 100, budgetPct: 80, maxCoins: 6, lev: 3, minTurn: 5, maxCand: 40, boxBars: 15, minBox: 0.4, maxBox: 4,
   buf: 0.1, pull: 0.1, chaseMax: 1, entryTimeout: 60, requote: 2, minProfit: 0.2, slRR: 1, hardSl: 0, tp: 0.6, act: 0.35, trail: 0.2, cooldown: 3, dayStop: 10,
+  imb: 0.35, flow: 0.3, depthPct: 0.3, flowSec: 10, confirm: 2, maxSpread: 0.08, flipExit: true,
   aiOn: true, aiTune: true, aiEvery: 5, aiMinConf: 60, aiTuneHours: 6,
   longOn: true, shortOn: true, btcFilter: false };
 const NUMS = ["simEq", "budgetPct", "maxCoins", "lev", "minTurn", "maxCand", "boxBars", "minBox", "maxBox", "buf", "pull", "chaseMax", "entryTimeout", "requote",
-  "minProfit", "slRR", "hardSl", "tp", "act", "trail", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours"];
-const BOOLS = ["live", "longOn", "shortOn", "btcFilter", "aiOn", "aiTune"];
+  "minProfit", "slRR", "hardSl", "imb", "flow", "depthPct", "flowSec", "confirm", "maxSpread", "tp", "act", "trail", "cooldown", "dayStop", "aiEvery", "aiMinConf", "aiTuneHours"];
+const BOOLS = ["live", "longOn", "shortOn", "btcFilter", "aiOn", "aiTune", "flipExit"];
 // в каких рамках ИИ может менять параметры
-const AI_BOUNDS = { tp: [0.3, 3], act: [0.2, 2], trail: [0.1, 1], minProfit: [0.1, 1], pull: [0, 0.5], minBox: [0.2, 2], maxBox: [1, 8], buf: [0, 0.5], boxBars: [5, 60], cooldown: [0, 30] };
+const AI_BOUNDS = { tp: [0.2, 2], act: [0.15, 1.5], trail: [0.05, 0.8], minProfit: [0.08, 0.8], imb: [0.15, 0.8], flow: [0.1, 0.9], depthPct: [0.1, 1], flowSec: [3, 60], confirm: [1, 5], maxSpread: [0.02, 0.3], cooldown: [0, 30] };
 const BLOCK = new Set(("SOXL SOXS UVXY TQQQ SQQQ MSTR NVDA AMDSTOCK AMD INTC MU MRVL CRWV NBIS SNDK SKHY SKHYNIX SAMSUNG SAMSUNGEM DRAM EWY TEM KORU MUU SNXX MSFU " +
   "AGPU CRCL SPCX OKTA LITE CBRS TSLA AAPL GOOGL AMZN META MSFT COIN HOOD PLTR NFLX SPY QQQ XAU XAG PAXG XAUT USDC USDE FDUSD DAI TUSD BUSD USD1 RLUSD PYUSD").split(" "));
 const blocked = (sym) => { const b = sym.replace(/USDT$/, ""); return BLOCK.has(b) || /STOCK$/.test(b); };
@@ -34,6 +32,7 @@ function create(host) {
   const dayOf = (t) => new Date(t || now()).toISOString().slice(0, 10);
 
   const CFG = Object.assign({}, DEF, lsGet("mb.cfg", {}));
+  if (!lsGet("mb.book1", false)) { Object.assign(CFG, { entryTimeout: 20, chaseMax: 0.3, tp: 0.4, act: 0.25, trail: 0.12, minProfit: 0.15, slRR: 1, btcFilter: false, minTurn: 10 }); lsSet("mb.book1", true); lsSet("mb.plus1", true); }   // стакан: короткие тейки
   if (!lsGet("mb.plus1", false)) { Object.assign(CFG, { pull: 0.1, chaseMax: 1, entryTimeout: 60, requote: 2, tp: 0.6, act: 0.35, trail: 0.2, hardSl: 0, minProfit: 0.2 }); for (const k of ["sl", "tpMax", "slip"]) delete CFG[k]; lsSet("mb.plus1", true); }   // выход только в плюс, только лимитки
   const saveCfg = () => lsSet("mb.cfg", CFG);
   saveCfg();
@@ -123,44 +122,61 @@ function create(host) {
     return EQ;
   }
   const notional = () => Math.max(6, EQ * CFG.budgetPct / 100 * Math.max(1, CFG.lev) / Math.max(1, CFG.maxCoins));
-  const levels = (c) => ({ up: c.hi * (1 + CFG.buf / 100), dn: c.lo * (1 - CFG.buf / 100) });
 
-  // ---------------- скан: самые волатильные монеты + коридор ----------------
+  // ---------------- стакан и поток сделок ----------------
+  async function bookRead(sym) {
+    const c = coin(sym);
+    const [ob, tr] = await Promise.all([
+      pub("/v5/market/orderbook", { category: "linear", symbol: sym, limit: 50 }),
+      pub("/v5/market/recent-trade", { category: "linear", symbol: sym, limit: 100 }),
+    ]);
+    const b = (ob.b || []).map(x => [+x[0], +x[1]]), a = (ob.a || []).map(x => [+x[0], +x[1]]);
+    if (!b.length || !a.length) return c;
+    c.bid = b[0][0]; c.ask = a[0][0];
+    const mid = (c.bid + c.ask) / 2, win = mid * CFG.depthPct / 100;
+    const bv = b.filter(x => x[0] >= mid - win).reduce((s, x) => s + x[0] * x[1], 0);
+    const av = a.filter(x => x[0] <= mid + win).reduce((s, x) => s + x[0] * x[1], 0);
+    c.I = bv + av > 0 ? (bv - av) / (bv + av) : 0;
+    c.depth = bv + av;
+    c.spread = (c.ask - c.bid) / mid * 100;
+    const list = tr.list || [], since = now() - CFG.flowSec * 1000;
+    let buy = 0, sell = 0, n = 0;
+    for (const t of list) { if (+t.time < since) continue; const v = +t.price * +t.size; if (t.side === "Buy") buy += v; else sell += v; n++; }
+    c.F = buy + sell > 0 && n >= 3 ? (buy - sell) / (buy + sell) : 0;
+    c.flowUsd = buy + sell;
+    c.last = list.length ? +list[0].price : mid;
+    // сигналы подряд
+    const upSig = c.I >= CFG.imb && c.F >= CFG.flow, dnSig = c.I <= -CFG.imb && c.F <= -CFG.flow;
+    c.sigL = upSig ? (c.sigL || 0) + 1 : 0;
+    c.sigS = dnSig ? (c.sigS || 0) + 1 : 0;
+    c.bookAt = now();
+    return c;
+  }
+
+  // ---------------- скан: ликвидные подвижные монеты (по тикерам, без свечей) ----------------
   async function scan() {
     if (scanBusy) return; scanBusy = true;
     try {
       await equity();
       const t = await pub("/v5/market/tickers", { category: "linear" });
-      const rows = (t.list || []).filter(x => /USDT$/.test(x.symbol) && !blocked(x.symbol) && +x.turnover24h >= CFG.minTurn * 1e6 && +x.lastPrice > 0);
-      const ch24 = {}; for (const x of rows) ch24[x.symbol] = +(+x.price24hPcnt * 100).toFixed(2);
-      const cand = rows.sort((a, b) => Math.abs(+b.price24hPcnt) - Math.abs(+a.price24hPcnt)).slice(0, CFG.maxCand).map(x => x.symbol);
+      const rows = (t.list || []).filter(x => /USDT$/.test(x.symbol) && !blocked(x.symbol) && +x.turnover24h >= CFG.minTurn * 1e6 && +x.lastPrice > 0 && +x.bid1Price > 0)
+        .map(x => { const mid = (+x.bid1Price + +x.ask1Price) / 2; return { sym: x.symbol, ch24: +(+x.price24hPcnt * 100).toFixed(2), range24: (+x.highPrice24h - +x.lowPrice24h) / +x.lastPrice * 100,
+          spread: (+x.ask1Price - +x.bid1Price) / mid * 100, turn: +x.turnover24h }; })
+        .filter(x => x.spread <= CFG.maxSpread && !FOREIGN.has(x.sym))
+        .sort((a, b) => b.range24 - a.range24).slice(0, CFG.maxCand);
       const held = Object.keys(OPEN);
-      const want = [...new Set([...cand, ...held, ...ACTIVE])];
-      const info = [];
-      for (let i = 0; i < want.length; i += 8) {
-        const part = await Promise.all(want.slice(i, i + 8).map(async (sym) => {
-          try {
-            const k = await pub("/v5/market/kline", { category: "linear", symbol: sym, interval: "1", limit: CFG.boxBars + 1 });
-            const bars = (k.list || []).map(r => ({ h: +r[2], l: +r[3], c: +r[4] }));   // newest first
-            if (bars.length < CFG.boxBars + 1) return null;
-            const past = bars.slice(1, CFG.boxBars + 1);
-            const hi = Math.max(...past.map(b => b.h)), lo = Math.min(...past.map(b => b.l)), mid = (hi + lo) / 2;
-            const atr = past.reduce((a, b) => a + (b.h - b.l) / b.c * 100, 0) / past.length;
-            return { sym, hi, lo, box: (hi - lo) / mid * 100, atr, last: bars[0].c, closes: bars.map(b => b.c).reverse() };
-          } catch (e) { return null; }
-        }));
-        info.push(...part.filter(Boolean));
-      }
-      for (const x of info) { const c = coin(x.sym); if (!c.work || c.work.kind !== "entry") Object.assign(c, { hi: x.hi, lo: x.lo, box: x.box, atr: x.atr }); }
-      const ok = info.filter(x => x.box >= CFG.minBox && x.box <= CFG.maxBox && !FOREIGN.has(x.sym)).sort((a, b) => b.atr - a.atr);
-      if (CFG.btcFilter || aiReady()) await btcTrend();
-      let next = ok.slice(0, CFG.maxCoins).map(x => x.sym);
+      let next = rows.slice(0, CFG.maxCoins).map(x => x.sym);
+      if (CFG.btcFilter) await btcTrend();
       if (aiReady()) {
-        if (now() - AI.at >= CFG.aiEvery * 60000 || AI.err) await aiDecide(ok.slice(0, Math.max(CFG.maxCoins * 2, 8)), ch24);
-        if (aiFresh()) next = ok.filter(x => AI.picks[x.sym] && AI.picks[x.sym].side !== "none" && AI.picks[x.sym].conf >= CFG.aiMinConf)
+        if (now() - AI.at >= CFG.aiEvery * 60000 || AI.err) {
+          const cands = rows.slice(0, Math.max(CFG.maxCoins * 2, 8));
+          await Promise.all(cands.map(x => bookRead(x.sym).catch(() => null)));
+          await aiDecide(cands);
+        }
+        if (aiFresh()) next = rows.filter(x => AI.picks[x.sym] && AI.picks[x.sym].side !== "none" && AI.picks[x.sym].conf >= CFG.aiMinConf)
           .sort((a, b) => AI.picks[b.sym].conf - AI.picks[a.sym].conf).slice(0, CFG.maxCoins).map(x => x.sym);
+        if (CFG.aiTune) aiTuneMaybe();
       }
-      if (aiReady() && CFG.aiTune) aiTuneMaybe();
       for (const s of [...held, ...Object.keys(C).filter(s => C[s].work)]) if (!next.includes(s)) next.push(s);
       const gone = ACTIVE.filter(s => !next.includes(s)), added = next.filter(s => !ACTIVE.includes(s));
       ACTIVE = next; lastScanAt = now();
@@ -177,13 +193,11 @@ function create(host) {
     return side === "Buy" ? rnd(Math.max(c.bid, c.ask - t), i.tick, "down") : rnd(Math.min(c.ask, c.bid + t), i.tick, "up");
   }
 
-  // вход: на уровне пробоя или на pull % за текущей ценой (что ближе к цене), но всегда в книге как мейкер
+  // вход: в начало стакана — на тик лучше лучшей заявки своей стороны, но мейкером (не пересекая спред)
   function entryPx(c, w, i) {
     const t = +i.tick, L = w.side === "Buy";
     if (!(c.bid > 0 && c.ask > 0)) return null;
-    let v = L ? Math.max(w.level, c.last * (1 - CFG.pull / 100)) : Math.min(w.level, c.last * (1 + CFG.pull / 100));
-    v = L ? Math.min(v, c.ask - t) : Math.max(v, c.bid + t);
-    return rnd(v, i.tick, L ? "down" : "up");
+    return L ? rnd(Math.min(c.ask - t, c.bid + t), i.tick, "down") : rnd(Math.max(c.bid + t, c.ask - t), i.tick, "up");
   }
 
   // выход: лучшая цена мейкера, но не хуже входа + minProfit % — в минус не выхожу (кроме ручного «закрыть всё»)
@@ -256,20 +270,16 @@ function create(host) {
     const a = TRADES.filter(t => t.live === isLive() && t.pnl != null && (!sym || t.sym === sym)).slice(0, sym ? 10 : 40);
     return a.map(t => ({ sym: t.sym.replace("USDT", ""), side: t.side === "Buy" ? "long" : "short", pnl: +t.pnl.toFixed(3), why: t.why, min: Math.round((t.close - t.open) / 60000), agoMin: Math.round((now() - t.close) / 60000) }));
   }
-  async function aiDecide(cands, ch24) {
+  async function aiDecide(cands) {
     if (!cands.length) { AI.picks = {}; AI.at = now(); AI.err = ""; saveAi(); return; }
-    const coins = cands.map(x => {
-      const pos = (x.last - x.lo) / Math.max(1e-12, x.hi - x.lo);
-      return { sym: x.sym.replace("USDT", ""), boxPct: +x.box.toFixed(2), atr1mPct: +x.atr.toFixed(2), posInBox: +pos.toFixed(2), ch24hPct: ch24[x.sym],
-        closes1m: x.closes.map(v => +((v / x.closes[0] - 1) * 100).toFixed(2)), recent: tradeStats(x.sym) };
-    });
-    const prompt = `You pick trades for a Bybit USDT-perpetual BREAKOUT scalper. For each coin the bot keeps a range = high/low of the last ${CFG.boxBars} one-minute candles.
-When price breaks ${CFG.buf}% beyond the range it enters with a maker limit order on the retest (${CFG.pull}% behind price), LONG above the high, SHORT below the low.
-Exit: a maker take +${CFG.tp}%, or trailing from +${CFG.act}% with ${CFG.trail}% callback (never below entry +${CFG.minProfit}%); risk 1:${CFG.slRR}: at −${(CFG.tp * CFG.slRR).toFixed(2)}% the position is closed by a chasing maker limit. Leverage ${CFG.lev}x. Maker fees ~0.04% round trip.
-Goal: maximise trades that reach profit quickly. Prefer coins whose breakouts follow through (trend, momentum, compression before breakout) and that mean-revert rather than collapse; avoid coins in a one-way dump/pump against the side, choppy fake-outs, or coins where the bot is already stuck.
-BTC 5m trend: ${BTC.why}.
-Coins (closes1m = % change of each 1m close vs the first, oldest first; posInBox 0 = at low, 1 = at high; recent = this bot's last trades on the coin):
-${JSON.stringify(coins)}
+    const coins = cands.map(x => { const c = coin(x.sym); return { sym: x.sym.replace("USDT", ""), ch24hPct: x.ch24, range24hPct: +x.range24.toFixed(2), spreadPct: +x.spread.toFixed(3),
+      bookImbalance: c.I != null ? +c.I.toFixed(2) : null, tradeFlow: c.F != null ? +c.F.toFixed(2) : null, flowUsd10s: c.flowUsd != null ? Math.round(c.flowUsd) : null,
+      depthUsd: c.depth != null ? Math.round(c.depth) : null, recent: tradeStats(x.sym) }; });
+    const prompt = `You pick coins for a Bybit USDT-perpetual ORDER-BOOK scalper (no charts). Every ~1.5 s it reads the order book and the last trades of each picked coin.
+It goes LONG when book imbalance >= ${CFG.imb} (bids vs asks within ${CFG.depthPct}% of price) AND taker flow >= ${CFG.flow} over ${CFG.flowSec}s, ${CFG.confirm}x in a row; SHORT mirrored.
+Entry and exit only with maker limit orders at the front of the book. Exit: maker take +${CFG.tp}%, trailing from +${CFG.act}% (callback ${CFG.trail}%), exit when the book flips against; risk 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%). Leverage ${CFG.lev}x. Maker fees ~0.04% round trip.
+Goal: maximise trades that reach the take fast. Prefer liquid coins with tight spread, real depth and order flow that follows through; avoid thin books that get spoofed, coins in a one-way crash against the side, or coins that just lost money here.
+Coins (bookImbalance and tradeFlow −1..+1 right now; recent = this bot's last trades on the coin): ${JSON.stringify(coins)}
 Last trades overall: ${JSON.stringify(tradeStats().slice(0, 20))}
 Answer ONLY one JSON object: {"picks":[{"sym":"ABC","side":"long|short|both|none","conf":0-100,"why":"коротко по-русски"}],"note":"одна фраза по-русски о рынке"}. Include every coin.`;
     try {
@@ -298,15 +308,15 @@ Answer ONLY one JSON object: {"picks":[{"sym":"ABC","side":"long|short|both|none
       const cur = {}; for (const k of Object.keys(AI_BOUNDS)) cur[k] = CFG[k];
       const sum = since.reduce((a, t) => a + t.pnl, 0), byWhy = {};
       for (const t of since) { const w = byWhy[t.why] || (byWhy[t.why] = { n: 0, pnl: 0 }); w.n++; w.pnl = +(w.pnl + t.pnl).toFixed(3); }
-      const prompt = `Tune a Bybit breakout scalper. Current params: ${JSON.stringify(cur)}. Allowed ranges: ${JSON.stringify(AI_BOUNDS)}.
-Meaning: tp = maker take %, act = trailing activation %, trail = trailing callback %, minProfit = minimum trailing exit profit %, the stop is −tp × ${CFG.slRR} (risk 1:${CFG.slRR}), pull = entry limit offset behind price %, minBox/maxBox = allowed range width %, buf = entry offset beyond range %, boxBars = range length in 1m candles, cooldown = minutes before re-entering a coin.
+      const prompt = `Tune a Bybit order-book scalper (maker limits only). Current params: ${JSON.stringify(cur)}. Allowed ranges: ${JSON.stringify(AI_BOUNDS)}.
+Meaning: tp = maker take %, act = trailing activation %, trail = trailing callback %, minProfit = minimum trailing exit profit %, the stop is −tp × ${CFG.slRR} (risk 1:${CFG.slRR}), imb = order-book imbalance threshold, flow = taker-flow threshold, depthPct = book window % around price, flowSec = flow window sec, confirm = signals in a row, maxSpread = max spread %, cooldown = minutes before re-entering a coin.
 Since the last tuning: ${since.length} trades, total PnL ${sum.toFixed(3)} USDT, by exit reason ${JSON.stringify(byWhy)}. Trades: ${JSON.stringify(tradeStats().slice(0, 40))}.
 Change at most 3 params, small steps, only if the data supports it. Answer ONLY JSON: {"set":{"param":value},"why":"коротко по-русски"}.`;
       const j = await host.fal(prompt, "You are a careful quant tuning a trading bot. Answer only with one JSON object.");
       const ch = [];
       for (const [k, v] of Object.entries(j.set || {})) {
         if (!AI_BOUNDS[k] || !Number.isFinite(+v)) continue;
-        const [lo, hi] = AI_BOUNDS[k], nv = +Math.min(hi, Math.max(lo, +v)).toFixed(k === "boxBars" || k === "cooldown" ? 0 : 2);
+        const [lo, hi] = AI_BOUNDS[k], nv = +Math.min(hi, Math.max(lo, +v)).toFixed(["confirm", "flowSec", "cooldown"].includes(k) ? 0 : 2);
         if (nv !== CFG[k]) { ch.push(`${k} ${CFG[k]}→${nv}`); CFG[k] = nv; }
       }
       saveCfg();
@@ -318,25 +328,26 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
 
   function wantEntry(c) {
     if (!running || DAY.paused || OPEN[c.sym] || (c.pos && c.pos.size > 0) || c.work) return null;
-    if ((COOL[c.sym] || 0) > now() || !ACTIVE.includes(c.sym) || !c.hi || !(c.box >= CFG.minBox && c.box <= CFG.maxBox) || FOREIGN.has(c.sym)) return null;
+    if ((COOL[c.sym] || 0) > now() || !ACTIVE.includes(c.sym) || FOREIGN.has(c.sym) || !c.bookAt || now() - c.bookAt > 5000) return null;
     if (Object.keys(OPEN).length + Object.values(C).filter(x => x.work && x.work.kind === "entry").length >= CFG.maxCoins) return null;
-    const { up, dn } = levels(c), p = c.last;
+    if (!(c.spread <= CFG.maxSpread)) return null;
     let okL = CFG.longOn && (!CFG.btcFilter || !BTC.down), okS = CFG.shortOn && (!CFG.btcFilter || !BTC.up);
     if (aiFresh()) {
       const a = AI.picks[c.sym];
       if (!a || a.conf < CFG.aiMinConf) return null;
       okL = okL && (a.side === "long" || a.side === "both"); okS = okS && (a.side === "short" || a.side === "both");
     }
-    if (okL && p >= up && p <= up * (1 + CFG.chaseMax / 100)) return { side: "Buy", level: up };
-    if (okS && p <= dn && p >= dn * (1 - CFG.chaseMax / 100)) return { side: "Sell", level: dn };
+    if (okL && c.sigL >= CFG.confirm) return { side: "Buy", level: c.ask };
+    if (okS && c.sigS >= CFG.confirm) return { side: "Sell", level: c.bid };
     return null;
   }
-  // вход ещё актуален? (цена у уровня, не вернулась в коридор, время не вышло)
+  const bookTxt = (c) => `стакан ${c.I >= 0 ? "+" : ""}${(c.I || 0).toFixed(2)} · поток ${c.F >= 0 ? "+" : ""}${(c.F || 0).toFixed(2)}`;
+  // вход ещё актуален? (стакан за нас, цена рядом, время не вышло)
   function entryValid(c, w) {
     if (now() - w.start > CFG.entryTimeout * 1000) return "время вышло";
     const p = c.last, L = w.side === "Buy";
     if (L ? p > w.level * (1 + CFG.chaseMax / 100) : p < w.level * (1 - CFG.chaseMax / 100)) return "цена ушла";
-    if (L ? p < c.hi : p > c.lo) return "вернулась в коридор";
+    if (L ? (c.I < 0 && c.F < 0) : (c.I > 0 && c.F > 0)) return "стакан развернулся";
     return null;
   }
   function exitWhy(c, o) {
@@ -348,6 +359,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (!o.trailOn && gain >= CFG.act) { o.trailOn = true; log(`${c.sym}: 🎯 трейлинг включён (+${gain.toFixed(2)}%)`); }
     if (CFG.slRR > 0 && CFG.tp > 0 && gain <= -CFG.tp * CFG.slRR) return "стоп 1:" + CFG.slRR;
     if (o.trailOn && (o.best / p - 1) * 100 * dir >= CFG.trail && gain >= CFG.minProfit) return "трейлинг";
+    if (CFG.flipExit && (L ? c.sigS : c.sigL) >= CFG.confirm) return gain >= CFG.minProfit ? "стакан против, в плюс" : "стакан против";
     return null;
   }
 
@@ -355,8 +367,8 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
   async function fast() {
     if (fastBusy) return; fastBusy = true;
     try {
-      const t = await pub("/v5/market/tickers", { category: "linear" });
-      for (const x of t.list || []) { const c = C[x.symbol]; if (c) { c.last = +x.lastPrice; c.bid = +x.bid1Price || 0; c.ask = +x.ask1Price || 0; } }
+      const syms = [...new Set([...ACTIVE, ...Object.keys(OPEN), ...Object.keys(C).filter(s => C[s].work)])];
+      await Promise.all(syms.map(s => bookRead(s).catch(e => { coin(s).bookAt = 0; })));
       if (now() - eqAt > 15000) await equity();
       if (isLive()) await fastLive(); else fastSim();
     } catch (e) { log("цикл: " + e.message, "err"); }
@@ -400,7 +412,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
           if (!c.pos) { await closedLive(sym, OPEN[sym].takeId ? "тейк" : "биржа"); continue; }   // тейк исполнился / аварийный стоп / вручную
           OPEN[sym].qty = c.pos.size;
           const why = exitWhy(c, OPEN[sym]); saveOpen();
-          if (why) { await cancelTake(c); c.work = { kind: "exit", side: opp(OPEN[sym].side), why, start: now(), noFloor: /^стоп/.test(why) }; log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.last)}`); await liveQuote(c, c.work); }
+          if (why) { await cancelTake(c); c.work = { kind: "exit", side: opp(OPEN[sym].side), why, start: now(), noFloor: /^стоп|^стакан против$/.test(why) }; log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.last)}`); await liveQuote(c, c.work); }
           else await ensureTake(c);
           continue;
         }
@@ -408,7 +420,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
         if (e) {
           await prep(sym);
           c.work = { kind: "entry", side: e.side, level: e.level, start: now() };
-          log(`${sym}: пробой ${e.side === "Buy" ? "вверх" : "вниз"} ${fmt(e.level)} (коридор ${fmt(c.lo)}–${fmt(c.hi)}) — ${e.side} лимиткой`);
+          log(`${sym}: ${e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой у ${fmt(e.level)}`);
           await liveQuote(c, c.work);
         }
       } catch (err) { log(`${sym}: ${err.message}`, "err"); }
@@ -489,7 +501,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       const mpx = (side) => side === "Buy" ? Math.max(c.bid, c.ask - tick) : Math.min(c.ask, c.bid + tick);
       const w = c.work;
       const filled = (w) => w.px != null && (w.side === "Buy" ? c.last <= w.px : c.last >= w.px);
-      const epx = (w) => { const L = w.side === "Buy"; let v = L ? Math.max(w.level, c.last * (1 - CFG.pull / 100)) : Math.min(w.level, c.last * (1 + CFG.pull / 100)); return L ? Math.min(v, c.ask - tick) : Math.max(v, c.bid + tick); };
+      const epx = (w) => w.side === "Buy" ? Math.min(c.ask - tick, c.bid + tick) : Math.max(c.bid + tick, c.ask - tick);
       const xpx = (w) => { const m = mpx(w.side), o = OPEN[sym]; if (!o || w.noFloor) return m; const L = o.side === "Buy", f = o.entry * (1 + (L ? 1 : -1) * CFG.minProfit / 100); return L ? Math.max(m, f) : Math.min(m, f); };
       const requote = (w) => { if (w.px == null || now() - w.placedAt >= CFG.requote * 1000) { w.px = w.kind === "entry" ? epx(w) : xpx(w); w.placedAt = now(); } };
       if (w && w.kind === "entry") {
@@ -522,7 +534,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
         }
         if (!c.work) {
           const why = exitWhy(c, o); saveOpen();
-          if (why) { c.work = { kind: "exit", side: opp(o.side), why, start: now(), noFloor: /^стоп/.test(why) }; requote(c.work); log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.work.px)}`); }
+          if (why) { c.work = { kind: "exit", side: opp(o.side), why, start: now(), noFloor: /^стоп|^стакан против$/.test(why) }; requote(c.work); log(`${sym}: выход (${why}) лимиткой @ ~${fmt(c.work.px)}`); }
         }
         continue;
       }
@@ -531,7 +543,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
       if (e) {
         c.work = { kind: "entry", side: e.side, level: e.level, start: now() }; requote(c.work);
         if (!INST[sym]) inst(sym).catch(() => {});
-        log(`${sym}: пробой ${e.side === "Buy" ? "вверх" : "вниз"} ${fmt(e.level)} (коридор ${fmt(c.lo)}–${fmt(c.hi)}) — ${e.side} лимиткой @ ${fmt(c.work.px)} (сим)`);
+        log(`${sym}: ${e.side === "Buy" ? "↑ покупатели давят" : "↓ продавцы давят"} (${bookTxt(c)}) — ${e.side} лимиткой @ ${fmt(c.work.px)} (сим)`);
       }
     }
   }
@@ -540,7 +552,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
   function loops() {
     clearInterval(scanTimer); clearInterval(fastTimer);
     scanTimer = setInterval(() => { if (running) scan(); }, +process.env.BOT_SCAN_MS || 60000);
-    fastTimer = setInterval(() => { if (running || Object.keys(OPEN).length) fast(); }, 2000);
+    fastTimer = setInterval(() => { if (running || Object.keys(OPEN).length) fast(); }, 1500);
   }
   async function cleanStale() {   // после перезапуска: снять висящие лимитки этого бота
     if (!isLive()) return;
@@ -559,7 +571,7 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
     if (CFG.live && !keys()) throw new Error("Нет BYBIT_API_KEY / BYBIT_API_SECRET — Live недоступен");
     running = true; lsSet("mb.running", true);
     await cleanStale();
-    log(`СТАРТ ${isLive() ? "LIVE" : "симуляция"} · только лимитки-мейкеры: до ${CFG.maxCoins} монет · коридор ${CFG.boxBars} мин (${CFG.minBox}–${CFG.maxBox}%) · пробой +${CFG.buf}% · догоняю до ${CFG.chaseMax}% / ${CFG.entryTimeout} с · вход на ${CFG.pull}% за ценой · тейк +${CFG.tp}% · трейлинг с +${CFG.act}% откат ${CFG.trail}% · трейлинг не хуже +${CFG.minProfit}% · стоп 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%) лимиткой · ИИ ${aiReady() ? "вкл" : "выкл"} · аварийный стоп ${CFG.hardSl || "выкл"}${CFG.hardSl ? "%" : ""} · плечо x${CFG.lev} · ${CFG.budgetPct}% депозита`, "ok");
+    log(`СТАРТ ${isLive() ? "LIVE" : "симуляция"} · по стакану, только лимитки-мейкеры: до ${CFG.maxCoins} монет · вход: стакан ≥ ${CFG.imb} и поток ≥ ${CFG.flow} (${CFG.flowSec} с) ${CFG.confirm}× подряд, спред ≤ ${CFG.maxSpread}% · тейк +${CFG.tp}% · трейлинг с +${CFG.act}% откат ${CFG.trail}% (≥ +${CFG.minProfit}%) · стоп 1:${CFG.slRR} (−${(CFG.tp * CFG.slRR).toFixed(2)}%) · ${CFG.flipExit ? "выход при развороте стакана · " : ""}ИИ ${aiReady() ? "вкл" : "выкл"} · аварийный стоп ${CFG.hardSl || "выкл"}${CFG.hardSl ? "%" : ""} · плечо x${CFG.lev} · ${CFG.budgetPct}% депозита`, "ok");
     loops(); scan();
     return isLive() ? "Запущено — LIVE" : "Запущено — симуляция";
   }
@@ -603,8 +615,8 @@ Change at most 3 params, small steps, only if the data supports it. Answer ONLY 
   }
   function view() {
     const coins = [...new Set([...ACTIVE, ...Object.keys(OPEN)])].map(s => {
-      const c = coin(s), lv = c.hi ? levels(c) : { up: null, dn: null };
-      return { sym: s, last: c.last, hi: c.hi, lo: c.lo, box: c.box, atr: c.atr, up: lv.up, dn: lv.dn,
+      const c = coin(s);
+      return { sym: s, last: c.last, I: c.I, F: c.F, spread: c.spread, flowUsd: c.flowUsd, sigL: c.sigL || 0, sigS: c.sigS || 0,
         work: c.work ? { kind: c.work.kind, side: c.work.side, px: c.work.px ? +c.work.px : null, why: c.work.why || null, n: c.work.n || 0 } : null,
         pos: c.pos && c.pos.size > 0 ? { side: c.pos.side, size: c.pos.size, avg: c.pos.avg, upnl: c.pos.upnl } : null,
         trailOn: OPEN[s] ? !!OPEN[s].trailOn : false, cool: Math.max(0, (COOL[s] || 0) - now()) };
