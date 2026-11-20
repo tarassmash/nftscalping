@@ -90,7 +90,7 @@ function create(host) {
   // ---------------- state ----------------
   const C = {};   // sym -> { sym, last, bid, ask, hi, lo, box, atr, pos, work, lev, hedge }
   const coin = (sym) => C[sym] || (C[sym] = { sym, last: 0, bid: 0, ask: 0, hi: 0, lo: 0, box: 0, atr: 0, pos: null, work: null, lev: false, hedge: null });
-  let lastBad = "", ACTIVE = [], EQ = 0, AVAIL = 0, FOREIGN = new Set(), lastScanAt = 0, scanBusy = false, fastBusy = false, scanTimer = null, fastTimer = null, eqAt = 0;
+  let noMoneyLog = 0, lastBad = "", ACTIVE = [], EQ = 0, AVAIL = 0, FOREIGN = new Set(), lastScanAt = 0, scanBusy = false, fastBusy = false, scanTimer = null, fastTimer = null, eqAt = 0;
   let BTC = { up: null, down: null, why: "—", at: 0 };
 
   async function btcTrend() {
@@ -124,7 +124,13 @@ function create(host) {
     }
     return EQ;
   }
-  const notional = () => Math.max(6, EQ * CFG.budgetPct / 100 * Math.max(1, CFG.lev) / Math.max(1, CFG.maxCoins));
+  const slots = () => manual() ? Math.max(1, Math.min(CFG.maxCoins, manualList().length)) : Math.max(1, CFG.maxCoins);
+  // объём позиции: доля депозита на монету × плечо, но не больше свободной маржи на счёте
+  const notional = () => {
+    const want = EQ * CFG.budgetPct / 100 * Math.max(1, CFG.lev) / slots();
+    const free = isLive() && AVAIL > 0 ? AVAIL * 0.95 * Math.max(1, CFG.lev) : Infinity;
+    return Math.max(6, Math.min(want, free));
+  };
 
   // ---------------- стакан и поток сделок ----------------
   async function bookRead(sym) {
@@ -272,6 +278,11 @@ function create(host) {
       w.orderId = r.orderId; w.placedAt = now(); w.px = px; w.n = (w.n || 0) + 1;
     } catch (e) {
       if (e.code === 110017 || e.code === 110025) { if (w.kind === "exit") w.done = true; return; }   // позиции уже нет
+      if (e.code === 110007) {   // нет свободной маржи — не долблю биржу
+        if (now() - noMoneyLog > 60000) { noMoneyLog = now(); log(`${c.sym}: не хватает свободной маржи на счёте (свободно ${AVAIL.toFixed(2)} USDT) — другой бот или позиции заняли депозит, жду`, "err"); }
+        if (w.kind === "entry") { c.work = null; COOL[c.sym] = now() + 30000; }
+        return;
+      }
       log(`${c.sym}: лимитка ${w.side}: ${e.message}`, "err");
     }
   }
