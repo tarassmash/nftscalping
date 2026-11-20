@@ -74,7 +74,8 @@ async function fal(prompt, system) {
 }
 
 // ---------------- the bot ----------------
-const BOT = require("./bot").create({ bx, lsGet, lsSet, keys: () => HAS_KEYS, log: (m) => log("bot", m), fal: FAL_KEY ? fal : null });
+const PRED = require("./predictor").createPredictor({ lsGet, lsSet, log: (m) => log("pred", m) });
+const BOT = require("./bot").create({ bx, lsGet, lsSet, keys: () => HAS_KEYS, log: (m) => log("bot", m), fal: FAL_KEY ? fal : null, pred: PRED });
 
 function state() { return { env: ENV, keys: HAS_KEYS, password: !!PASSWORD, bot: BOT.view() }; }
 async function act(b) {
@@ -85,6 +86,7 @@ async function act(b) {
   if (what === "stop") return await BOT.stop();
   if (what === "closeAll") return await BOT.closeAll();
   if (what === "reset") return BOT.resetStats();
+  if (what === "predReset") return BOT.predReset();
   if (what === "test") {
     await bx("/v5/market/time");
     if (!HAS_KEYS) return "Связь с Bybit OK (ключей нет — только симуляция)";

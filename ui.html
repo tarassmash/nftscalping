@@ -72,6 +72,13 @@
     <div class="row"><label>Подстройка раз в, часов</label><input type="number" id="aiTuneHours" min="1" step="1"></div>
     <div class="note" id="aiNote"></div>
 
+    <h2>📈 Прогноз 5 мин (фильтр входа)</h2>
+    <div class="row"><label>Не входить против прогноза</label><input type="checkbox" id="predOn"></div>
+    <div class="row"><label>Мин. P в сторону сделки, %</label><input type="number" id="predMin" min="0" max="90" step="1"></div>
+    <div class="note" id="predNote">—</div>
+    <button class="btn sec" id="bPredReset" style="padding:7px;font-size:.8rem">Сбросить обучение прогноза</button>
+    <div class="note">Стакан, лента (CVD), OI, фандинг, ликвидации и киты в реальном времени (WebSocket Bybit). Каждый прогноз через 5 мин сверяется с ценой, модель дообучается. 50% = не входить, только если прогноз против; 55–60% = входить только с прогнозом, реже, но аккуратнее.</div>
+
     <h2>Монеты</h2>
     <label class="mut" style="font-size:.85rem">Монеты вручную (через запятую, пусто = бот выбирает сам)</label>
     <input type="text" id="coins" placeholder="например ENA, PEPE, SOL" style="width:100%;margin:4px 0 8px;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:7px 8px;font:inherit;text-transform:uppercase">
@@ -131,16 +138,16 @@
     <div class="panel">
       <h2>Монеты <span class="mut" id="scanAt" style="text-transform:none;letter-spacing:0"></span></h2>
       <div class="tbl"><table>
-        <thead><tr><th>Монета</th><th>Цена</th><th>Стакан</th><th>Поток</th><th>Спред</th><th>Сигнал</th><th>Лимитка</th><th>ИИ</th><th>Позиция</th><th>PnL</th></tr></thead>
-        <tbody id="coins"><tr><td colspan="10" class="mut">—</td></tr></tbody>
+        <thead><tr><th>Монета</th><th>Цена</th><th>Стакан</th><th>Поток</th><th>Спред</th><th>Сигнал</th><th>Лимитка</th><th>ИИ</th><th>5м ↑</th><th>Позиция</th><th>PnL</th></tr></thead>
+        <tbody id="coins"><tr><td colspan="11" class="mut">—</td></tr></tbody>
       </table></div>
     </div>
 
     <div class="panel">
       <h2>Сделки</h2>
       <div class="tbl"><table>
-        <thead><tr><th>Монета</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>Причина</th><th>Длит.</th><th>PnL</th><th>Закрыта</th></tr></thead>
-        <tbody id="trades"><tr><td colspan="8" class="mut">—</td></tr></tbody>
+        <thead><tr><th>Монета</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>Причина</th><th>5м</th><th>Длит.</th><th>PnL</th><th>Закрыта</th></tr></thead>
+        <tbody id="trades"><tr><td colspan="9" class="mut">—</td></tr></tbody>
       </table></div>
     </div>
 
@@ -153,8 +160,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const NUMS = ["maxCoins","minTurn","maxCand","imb","flow","depthPct","flowSec","confirm","maxSpread","chaseMax","entryTimeout","requote","minProfit","slRR","hardSl","tp","act","trail","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours"];
-const BOOLS = ["live","longOn","shortOn","btcFilter","aiOn","aiTune","flipExit"];
+const NUMS = ["maxCoins","minTurn","maxCand","imb","flow","depthPct","flowSec","confirm","maxSpread","chaseMax","entryTimeout","requote","minProfit","slRR","hardSl","tp","act","trail","cooldown","lev","budgetPct","dayStop","simEq","aiEvery","aiMinConf","aiTuneHours","predMin"];
+const BOOLS = ["live","longOn","shortOn","btcFilter","aiOn","aiTune","flipExit","predOn"];
 let filled = false;
 const DIRTY = new Set();   // поля, которые пользователь изменил и которые ещё не подтверждены сервером — их не перезаписываю
 const f = (v, d) => v == null || !isFinite(v) ? "—" : (+v).toFixed(d == null ? 2 : d);
@@ -198,6 +205,7 @@ async function act(what, quiet) {
 $("coins").addEventListener("keydown", (e) => { if (e.key === "Enter") act("save"); });
 $("bStart").onclick = () => act("start"); $("bStop").onclick = () => act("stop"); $("bSave").onclick = () => act("save");
 $("bTest").onclick = () => act("test"); $("bClose").onclick = () => act("closeAll");
+$("bPredReset").onclick = () => { if (confirm("Сбросить обучение 5-мин прогноза и его статистику?")) act("predReset"); };
 $("bReset").onclick = () => { if (confirm("Очистить статистику сделок?")) act("reset"); };
 
 function aiCell(ai, sym) {
@@ -207,8 +215,19 @@ function aiCell(ai, sym) {
   const c = x.side === "long" ? "up" : x.side === "short" ? "dn" : x.side === "both" ? "" : "mut";
   return `<span class="${c}" title="${(x.why || "").replace(/"/g, "&quot;")}">${arrow} ${x.conf}%</span>`;
 }
+function predCell(x) {
+  if (!x) return "<span class='mut'>—</span>";
+  if (!x.ready) return `<span class='mut'>${x.why || "…"}</span>`;
+  const v = x.pUp * 100;
+  return `<span class="${v >= 55 ? "up" : v <= 45 ? "dn" : "mut"}" title="${x.full ? "все факторы" : "OI/CVD 5м ещё копятся"}">${v.toFixed(0)}%${x.full ? "" : "*"}</span>`;
+}
+const pct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
 function render(s) {
   const b = s.bot;
+  const pr = b.pred;
+  $("predNote").innerHTML = !pr ? "—" : `${pr.ws ? "<span class='up'>● поток Bybit</span>" : "<span class='dn'>● нет связи с WebSocket</span>"} · монет ${pr.subs}<br>
+    Точность: <b>${pct(pr.acc)}</b> из ${pr.n} проверок · уверенные (&gt;60/&lt;40%): <b>${pct(pr.confAcc)}</b> (${pr.confN}) · за 24ч ${pct(pr.dayAcc)} (${pr.dayN})<br>
+    Brier ${pr.brier == null ? "—" : pr.brier.toFixed(4)} (меньше 0.25 = лучше монетки) · отсеяно входов ${pr.blocked} · снято ожидающих ${pr.cancelled}`;
   const ai = b.ai || {};
   $("aiNote").innerHTML = !ai.hasKey ? "<span class='dn'>Нет FAL_KEY — нейросеть выключена</span>"
     : (ai.err ? `<span class='dn'>ИИ: ${ai.err}</span>` : (ai.at ? `Решение ${tm(ai.at)}${ai.note ? " · " + ai.note : ""}` : "ждёт первого скана"))
@@ -238,12 +257,12 @@ function render(s) {
     return `<tr><td><b>${c.sym.replace("USDT", "")}</b></td><td>${p(c.last)}</td><td class="${cls(c.I)}">${c.I == null ? "—" : sgn(c.I, 2)}</td><td class="${cls(c.F)}">${c.F == null ? "—" : sgn(c.F, 2)}</td><td>${f(c.spread, 3)}%</td>
       <td>${c.sigL ? `<span class="up">↑×${c.sigL}</span>` : c.sigS ? `<span class="dn">↓×${c.sigS}</span>` : "<span class='mut'>—</span>"}</td>
       <td>${c.work ? `<span class="${c.work.side === "Buy" ? "up" : "dn"}">${c.work.kind === "entry" ? "вход" : "выход" + (c.work.why ? " (" + c.work.why + ")" : "")} ${c.work.side} @ ${p(c.work.px)}</span>` : "<span class='mut'>—</span>"}</td>
-      <td>${aiCell(b.ai, c.sym)}</td><td>${pos}</td><td class="${c.pos ? cls(c.pos.upnl) : "mut"}">${c.pos ? sgn(c.pos.upnl, 3) : "—"}</td></tr>`;
-  }).join("") : `<tr><td colspan="10" class="mut">${b.running ? "жду скан…" : "бот остановлен"}</td></tr>`;
+      <td>${aiCell(b.ai, c.sym)}</td><td>${predCell(c.pred)}</td><td>${pos}</td><td class="${c.pos ? cls(c.pos.upnl) : "mut"}">${c.pos ? sgn(c.pos.upnl, 3) : "—"}</td></tr>`;
+  }).join("") : `<tr><td colspan="11" class="mut">${b.running ? "жду скан…" : "бот остановлен"}</td></tr>`;
   $("trades").innerHTML = b.trades.length ? b.trades.map(t => `<tr><td><b>${t.sym.replace("USDT", "")}</b></td>
     <td class="${t.side === "Buy" ? "up" : "dn"}">${t.side === "Buy" ? "лонг" : "шорт"}</td><td>${p(t.entry)}</td><td>${p(t.exit)}</td><td>${t.why}</td>
-    <td>${dur(t.close - t.open)}</td><td class="${cls(t.pnl)}">${t.pnl == null ? "—" : sgn(t.pnl, 3)}</td><td class="mut">${tm(t.close)}</td></tr>`).join("")
-    : `<tr><td colspan="8" class="mut">сделок пока нет</td></tr>`;
+    <td class="mut">${t.pUp == null ? "—" : Math.round((t.side === "Buy" ? t.pUp : 1 - t.pUp) * 100) + "%"}</td><td>${dur(t.close - t.open)}</td><td class="${cls(t.pnl)}">${t.pnl == null ? "—" : sgn(t.pnl, 3)}</td><td class="mut">${tm(t.close)}</td></tr>`).join("")
+    : `<tr><td colspan="9" class="mut">сделок пока нет</td></tr>`;
   $("log").innerHTML = b.log.map(l => `<div class="${l[2]}">${tm(l[0])} ${l[1].replace(/</g, "&lt;")}</div>`).join("");
 }
 async function refresh() {
